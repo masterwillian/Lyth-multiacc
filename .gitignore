@@ -1,0 +1,24 @@
+# Dependencies and generated builds
+TorMultiClient/node_modules/
+TorMultiClient/dist/
+
+# Runtime logs
+TorMultiClient/logs/
+*.log
+
+# Per-account Tor runtime state (contains local identity/session data)
+tor/instance*/
+**/control_auth_cookie
+**/cached-*
+**/unverified-*
+**/state
+**/lock
+
+# Local environment and editor files
+.env
+.env.*
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+

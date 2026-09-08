@@ -1,0 +1,36 @@
+{
+  "groups": [
+    {
+      "id": 1,
+      "name": "Lote 5",
+      "accounts": [
+        {
+          "id": 1,
+          "name": "teste1"
+        },
+        {
+          "id": 2,
+          "name": "não mudar"
+        }
+      ],
+      "tag": "",
+      "note": ""
+    },
+    {
+      "id": 2,
+      "name": "Lote 3",
+      "accounts": [
+        {
+          "id": 5,
+          "name": "Conta 5"
+        },
+        {
+          "id": 6,
+          "name": "Conta 6"
+        }
+      ],
+      "tag": "",
+      "note": ""
+    }
+  ]
+}
