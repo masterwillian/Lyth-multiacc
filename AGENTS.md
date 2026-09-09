@@ -8,10 +8,12 @@ Chromium sessions, each routed through a separate Tor instance.
 1. Read `README.md`, `CHANGELOG.md`, and the relevant files under
    `TorMultiClient/`.
 2. Read `docs/MEMORY_PROTOCOL.md`.
-3. If the local `.memory/` bridge exists, read `.memory/INDEX.md`,
+3. For Goal Mode or other long-running work, read and follow
+   `docs/DELIVERY_LOOP.md`.
+4. If the local `.memory/` bridge exists, read `.memory/INDEX.md`,
    `.memory/CURRENT_STATE.md`, `.memory/DECISIONS.md`, and
    `.memory/KNOWN_ISSUES.md` before planning changes.
-4. Inspect `git status` and preserve unrelated user changes.
+5. Inspect `git status` and preserve unrelated user changes.
 
 ## Team workflow
 
@@ -53,5 +55,7 @@ Chromium sessions, each routed through a separate Tor instance.
 - Update relevant project documentation when behavior or architecture changes.
 - Update the local Obsidian memory through `.memory/` when it exists, following
   `docs/MEMORY_PROTOCOL.md`.
+- For an active goal, satisfy every completion gate in `docs/DELIVERY_LOOP.md`
+  and update its goal log before declaring completion.
 - A task is complete only when implementation, relevant validation, and durable
   notes agree.

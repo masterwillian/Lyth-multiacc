@@ -13,6 +13,7 @@ At the start of a substantial task, read:
 3. `.memory/DECISIONS.md`
 4. `.memory/KNOWN_ISSUES.md`
 5. the most recent relevant entry in `.memory/Sessions/`
+6. for Goal Mode, the active entry in `.memory/Goals/`
 
 If `.memory/` is absent, continue using repository documentation. The external
 memory must never be required to build, test, or run the application.
@@ -27,6 +28,7 @@ At the end of meaningful work:
 - update `ROADMAP.md` only when priorities change;
 - create a short session note containing outcome, evidence, tests, commit, and
   next step.
+- maintain the active goal log according to `docs/DELIVERY_LOOP.md`.
 
 Do not copy raw chat transcripts. Summarize only information that will matter in
 a future task.
