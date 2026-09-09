@@ -1,6 +1,6 @@
 {
   "name": "hub-bliw",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Gerenciador de sessões isoladas através da rede Tor",
   "main": "main.js",
   "scripts": {

@@ -16,6 +16,15 @@ que a sessão Electron continua usando o proxy correto.
 5. **New Identity:** depois de `SIGNAL NEWNYM`, as conexões são fechadas e o IP de
    saída é consultado novamente. O Tor não garante que o IP será diferente.
 
+## Navegação fail-closed
+
+- Cada `partition` Electron recebe o proxy e um bloqueio de rede antes da criação das webviews.
+- Requisições HTTP, HTTPS e WebSocket permanecem bloqueadas durante bootstrap, falhas e recuperação.
+- A liberação ocorre somente após confirmar ControlPort, circuito, `resolveProxy` e o IP de saída pela própria sessão Chromium.
+- A consulta de verificação é a única requisição externa permitida enquanto a conta está bloqueada.
+- O cache HTTP da sessão fica desabilitado, o cache DNS é limpo antes do boot e a primeira navegação também solicita conteúdo sem cache.
+- Se qualquer validação inicial falhar, o aplicativo mantém a navegação bloqueada e informa o erro no splash.
+
 ## Frequência e tolerância
 
 - ControlPort e sessão: aproximadamente a cada 30 segundos.

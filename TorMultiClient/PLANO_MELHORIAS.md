@@ -18,6 +18,11 @@ A arquitetura atual já entrega a base funcional:
 
 No entanto, ele ainda é um protótipo funcional com muitos pontos de melhoria em estabilidade, observabilidade, organização e qualidade operacional.
 
+> Atualização v0.2.3: a navegação passou a operar em modo fail-closed. As sessões são
+> configuradas antes das webviews e só recebem tráfego externo depois da validação
+> do circuito, proxy e IP de saída pela sessão Chromium. A primeira navegação ignora
+> respostas antigas do cache.
+
 ---
 
 ## 2. O que o projeto consegue fazer hoje

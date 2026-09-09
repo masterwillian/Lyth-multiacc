@@ -1,7 +1,7 @@
 const { contextBridge, ipcRenderer } = require("electron");
 
 contextBridge.exposeInMainWorld("multiClient", {
-    version: "0.2.2",
+    version: "0.2.3",
 
     getWorkspace: () => ipcRenderer.invoke("get-workspace"),
     createGroup: (data) => ipcRenderer.invoke("create-group", data),

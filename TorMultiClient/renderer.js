@@ -243,6 +243,7 @@ const webviews = {};
 const ipBadges = {};
 const initialPageLoaders = {};
 const latestHealthUpdates = {};
+const navigationReadyAccounts = new Set();
 const DEFAULT_START_URL = "https://checkip.amazonaws.com/";
 
 function isPersistableUrl(url) {
@@ -270,6 +271,15 @@ function updateAccountStatus(accountId, statusState) {
     const incomingTimestamp = Number(statusState.lastUpdated) || 0;
     if (incomingTimestamp && incomingTimestamp < (latestHealthUpdates[accountId] || 0)) return;
     latestHealthUpdates[accountId] = incomingTimestamp;
+
+    const isNavigationReady = statusState.status === "ready"
+        && statusState.bootstrapped === true
+        && statusState.circuitEstablished === true
+        && statusState.proxyConfigured === true
+        && typeof statusState.currentIP === "string"
+        && statusState.currentIP.length > 0;
+    if (isNavigationReady) navigationReadyAccounts.add(Number(accountId));
+    else navigationReadyAccounts.delete(Number(accountId));
 
     const indicator = document.querySelector(`.account-status[data-account-id="${accountId}"]`);
     const label = document.querySelector(`.account-status-label[data-account-id="${accountId}"]`);
@@ -510,11 +520,13 @@ function createAccountPanel(account) {
     function loadInitialPage() {
         // O dom-ready inicial pode ocorrer antes do listener em versões do Electron.
         if (!guestReady && wv.getURL() === "about:blank") guestReady = true;
-        if (!appBootCompleted || !guestReady || initialNavigationStarted) return;
+        if (!appBootCompleted || !guestReady || initialNavigationStarted || !navigationReadyAccounts.has(account.id)) return;
         const initialUrl = wv.dataset.initialUrl;
         if (!initialUrl) return;
         initialNavigationStarted = true;
-        wv.loadURL(initialUrl).catch(error => {
+        wv.loadURL(initialUrl, {
+            extraHeaders: "pragma: no-cache\ncache-control: no-cache, no-store\n"
+        }).catch(error => {
             initialNavigationStarted = false;
             console.error(`Não foi possível carregar a URL inicial da conta ${account.id}:`, error);
         });
@@ -529,6 +541,10 @@ function createAccountPanel(account) {
 
     // — Navegação —
     function navigate() {
+        if (!navigationReadyAccounts.has(account.id)) {
+            console.warn(`Navegação bloqueada: a saída Tor da conta ${account.id} ainda não foi validada.`);
+            return;
+        }
         let url = urlInput.value.trim();
         if (!url) return;
         if (!url.startsWith("http://") && !url.startsWith("https://")) {
@@ -536,7 +552,11 @@ function createAccountPanel(account) {
             urlInput.value = url;
         }
         localStorage.setItem(`account-url-${account.id}`, url);
-        wv.src = url;
+        wv.loadURL(url, {
+            extraHeaders: "pragma: no-cache\ncache-control: no-cache\n"
+        }).catch(error => {
+            console.error(`Não foi possível navegar a conta ${account.id}:`, error);
+        });
     }
 
     backBtn.addEventListener("click",   () => wv.goBack());
@@ -1060,6 +1080,7 @@ mc.onAccountRemoved(accountId => {
     delete ipBadges[accountId];
     delete initialPageLoaders[accountId];
     delete latestHealthUpdates[accountId];
+    navigationReadyAccounts.delete(accountId);
     updateOverviewGridLayout();
     applyVisibleAccounts();
 });
