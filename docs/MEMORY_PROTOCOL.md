@@ -49,4 +49,3 @@ claims and label assumptions explicitly.
 Never store passwords, API keys, OAuth tokens, cookies, SSH keys, personal
 account content, browser session data, Tor identity data, or unredacted logs in
 the vault.
-

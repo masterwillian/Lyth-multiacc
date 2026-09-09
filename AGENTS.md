@@ -55,4 +55,3 @@ Chromium sessions, each routed through a separate Tor instance.
   `docs/MEMORY_PROTOCOL.md`.
 - A task is complete only when implementation, relevant validation, and durable
   notes agree.
-
