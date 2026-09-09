@@ -77,6 +77,21 @@ function reorderOverview(sourceId, targetId) {
 
 let appBootCompleted = false;
 
+function reloadAllAccounts() {
+    if (!appBootCompleted) return;
+
+    const webviewEntries = Object.entries(webviews);
+    if (!webviewEntries.length) return;
+
+    webviewEntries.forEach(([accountId, wv]) => {
+        if (wv && typeof wv.reload === "function" && !wv.isLoading()) {
+            try {
+                wv.reload();
+            } catch (_) {}
+        }
+    });
+}
+
 function applyGroupAccent(element, groupId) {
     const color = getGroupColor(groupId);
     element.style.setProperty("--group-accent", color);
@@ -163,9 +178,13 @@ mc.onBootComplete(() => {
     appBootCompleted = true;
     splashStatus.textContent = "✅ Todos prontos! Carregando…";
     
-    // Cada webview só navega depois que o guest about:blank estiver pronto.
-    Object.keys(initialPageLoaders).forEach(accountId => {
-        initialPageLoaders[accountId]();
+    // Carrega URLs nas webviews agora que o proxy está pronto
+    Object.keys(webviews).forEach(accountId => {
+        const wv = webviews[accountId];
+        const initialUrl = wv.dataset.initialUrl;
+        if (wv && initialUrl) {
+            wv.src = initialUrl;
+        }
     });
     
     setTimeout(() => {
@@ -178,6 +197,18 @@ mc.onBootError((msg) => {
     splashStatus.textContent = `❌ Erro: ${msg}`;
     splashStatus.style.color = "#ff5555";
 });
+
+// ══════════════════════════════════════════════════
+// KEYBOARD SHORTCUTS HELP
+// ══════════════════════════════════════════════════
+console.log(`
+🎮 Keyboard Shortcuts:
+  Ctrl+L  — Focar URL bar
+  Ctrl+R  — Recarregar página
+  Ctrl+W  — Remover conta
+  Ctrl+K  — Forçar novo circuito Tor
+  Ctrl+D  — Abrir DevTools
+`);
 
 // ══════════════════════════════════════════════════
 // LAYOUT TOGGLE
@@ -241,49 +272,10 @@ function applyVisibleAccounts() {
 // Referências globais por conta (para New Identity e DevTools)
 const webviews = {};
 const ipBadges = {};
-const initialPageLoaders = {};
-const latestHealthUpdates = {};
-const navigationReadyAccounts = new Set();
-const DEFAULT_START_URL = "https://checkip.amazonaws.com/";
-
-function isPersistableUrl(url) {
-    return typeof url === "string" && (url.startsWith("https://") || url.startsWith("http://"));
-}
-
-function getInitialAccountUrl(accountId) {
-    const savedUrl = localStorage.getItem(`account-url-${accountId}`);
-    if (isPersistableUrl(savedUrl)) return savedUrl;
-
-    try {
-        const history = JSON.parse(localStorage.getItem(historyKey(accountId)) || "[]");
-        const recoveredUrl = history.find(isPersistableUrl);
-        if (recoveredUrl) {
-            localStorage.setItem(`account-url-${accountId}`, recoveredUrl);
-            return recoveredUrl;
-        }
-    } catch (_) {}
-
-    localStorage.setItem(`account-url-${accountId}`, DEFAULT_START_URL);
-    return DEFAULT_START_URL;
-}
 
 function updateAccountStatus(accountId, statusState) {
-    const incomingTimestamp = Number(statusState.lastUpdated) || 0;
-    if (incomingTimestamp && incomingTimestamp < (latestHealthUpdates[accountId] || 0)) return;
-    latestHealthUpdates[accountId] = incomingTimestamp;
-
-    const isNavigationReady = statusState.status === "ready"
-        && statusState.bootstrapped === true
-        && statusState.circuitEstablished === true
-        && statusState.proxyConfigured === true
-        && typeof statusState.currentIP === "string"
-        && statusState.currentIP.length > 0;
-    if (isNavigationReady) navigationReadyAccounts.add(Number(accountId));
-    else navigationReadyAccounts.delete(Number(accountId));
-
     const indicator = document.querySelector(`.account-status[data-account-id="${accountId}"]`);
     const label = document.querySelector(`.account-status-label[data-account-id="${accountId}"]`);
-    const cell = document.querySelector(`.cell[data-account-id="${accountId}"]`);
     if (indicator) {
         indicator.className = `account-status status-${statusState.status || "unknown"}`;
         indicator.title = statusState.message || "Sem status";
@@ -291,27 +283,6 @@ function updateAccountStatus(accountId, statusState) {
     if (label) {
         label.textContent = statusState.message || "Sem status";
     }
-    if (cell) {
-        cell.dataset.health = statusState.status || "unknown";
-    }
-
-    const ipBadge = ipBadges[accountId];
-    if (!ipBadge) return;
-
-    if (statusState.currentIP) {
-        saveIp(accountId, statusState.currentIP);
-        ipBadge.className = "ip-badge ready";
-        ipBadge.textContent = statusState.currentIP;
-        ipBadge.title = "IP confirmado pelo health-check através do proxy Tor";
-        return;
-    }
-
-    const account = accounts.find(item => item.id === Number(accountId));
-    ipBadge.className = ["error", "degraded"].includes(statusState.status)
-        ? "ip-badge error"
-        : "ip-badge loading";
-    ipBadge.textContent = account ? `Tor :${account.torPort}` : "IP não verificado";
-    ipBadge.title = "Aguardando verificação do IP pelo health-check";
 }
 
 function createAccountPanel(account) {
@@ -405,7 +376,7 @@ function createAccountPanel(account) {
     const urlInput = document.createElement("input");
     urlInput.className = "cell-url";
     urlInput.type = "text";
-    urlInput.value = getInitialAccountUrl(account.id);
+    urlInput.value = localStorage.getItem(`account-url-${account.id}`) || "https://checkip.amazonaws.com/";
     urlInput.placeholder = "https://...";
     urlInput.setAttribute("list", listId);
 
@@ -442,11 +413,18 @@ function createAccountPanel(account) {
         if (newIdBtn.disabled) return;
         newIdBtn.disabled = true;
         newIdBtn.classList.add("spinning");
+        ipBadge.className = "ip-badge spinning";
+        ipBadge.textContent = "Trocando IP…";
+
         try {
             await mc.newIdentity(account.id);
+            // Dá tempo para o Tor criar o novo circuito antes da consulta.
+            await delay(4000);
             const wv = webviews[account.id];
             if (wv) wv.reloadIgnoringCache();
         } catch (e) {
+            ipBadge.className = "ip-badge error";
+            ipBadge.textContent = "⚠ ControlPort";
             console.error("New Identity error:", e);
         } finally {
             newIdBtn.disabled = false;
@@ -500,7 +478,7 @@ function createAccountPanel(account) {
     actionBtns.append(newIdBtn, ipHistoryBtn, devBtn, focusBtn, removeBtn);
 
     // — Monta barra —
-    bar.append(label, statusWrap, navBtns, urlWrap, ipBadge, actionBtns);
+    bar.append(label, navBtns, urlWrap, ipBadge, actionBtns);
 
     // ── Progress bar de carregamento de página ──
     const pageProgress = document.createElement("div");
@@ -515,36 +493,8 @@ function createAccountPanel(account) {
     webviews[account.id] = wv;
     wv.dataset.initialUrl = urlInput.value;
 
-    let guestReady = false;
-    let initialNavigationStarted = false;
-    function loadInitialPage() {
-        // O dom-ready inicial pode ocorrer antes do listener em versões do Electron.
-        if (!guestReady && wv.getURL() === "about:blank") guestReady = true;
-        if (!appBootCompleted || !guestReady || initialNavigationStarted || !navigationReadyAccounts.has(account.id)) return;
-        const initialUrl = wv.dataset.initialUrl;
-        if (!initialUrl) return;
-        initialNavigationStarted = true;
-        wv.loadURL(initialUrl, {
-            extraHeaders: "pragma: no-cache\ncache-control: no-cache, no-store\n"
-        }).catch(error => {
-            initialNavigationStarted = false;
-            console.error(`Não foi possível carregar a URL inicial da conta ${account.id}:`, error);
-        });
-    }
-    initialPageLoaders[account.id] = loadInitialPage;
-    wv.addEventListener("dom-ready", () => {
-        if (!initialNavigationStarted && wv.getURL() === "about:blank") {
-            guestReady = true;
-            loadInitialPage();
-        }
-    });
-
     // — Navegação —
     function navigate() {
-        if (!navigationReadyAccounts.has(account.id)) {
-            console.warn(`Navegação bloqueada: a saída Tor da conta ${account.id} ainda não foi validada.`);
-            return;
-        }
         let url = urlInput.value.trim();
         if (!url) return;
         if (!url.startsWith("http://") && !url.startsWith("https://")) {
@@ -552,11 +502,7 @@ function createAccountPanel(account) {
             urlInput.value = url;
         }
         localStorage.setItem(`account-url-${account.id}`, url);
-        wv.loadURL(url, {
-            extraHeaders: "pragma: no-cache\ncache-control: no-cache\n"
-        }).catch(error => {
-            console.error(`Não foi possível navegar a conta ${account.id}:`, error);
-        });
+        wv.src = url;
     }
 
     backBtn.addEventListener("click",   () => wv.goBack());
@@ -570,14 +516,13 @@ function createAccountPanel(account) {
 
     // — Atualiza URL bar ao navegar —
     wv.addEventListener("did-navigate", e => {
-        if (!isPersistableUrl(e.url)) return;
         urlInput.value = e.url;
         localStorage.setItem(`account-url-${account.id}`, e.url);
         pushHistory(account.id, e.url, datalist);
     });
 
     wv.addEventListener("did-navigate-in-page", e => {
-        if (e.isMainFrame && isPersistableUrl(e.url)) {
+        if (e.isMainFrame) {
             urlInput.value = e.url;
             localStorage.setItem(`account-url-${account.id}`, e.url);
             pushHistory(account.id, e.url, datalist);
@@ -604,7 +549,7 @@ function createAccountPanel(account) {
         fwdBtn.disabled   = !wv.canGoForward();
     });
 
-    // — Proteção básica contra fingerprinting de canvas/WebGL ──
+    // — Detecção de IP + Canvas Fingerprinting Protection ──
     wv.addEventListener("did-finish-load", () => {
         // Injeta proteção contra Canvas Fingerprinting
         const canvasProtectionScript = `
@@ -659,10 +604,36 @@ function createAccountPanel(account) {
             console.log('Canvas protection injection skipped');
         }
 
+        // Detecção de IP
+        wv.executeJavaScript(`
+            (() => {
+                const txt = document.body ? document.body.innerText.trim() : "";
+                try {
+                    const obj = JSON.parse(txt);
+                    if (obj.ip) return obj.ip;
+                } catch (_) {}
+                const m = txt.match(/\\b(\\d{1,3}\\.){3}\\d{1,3}\\b/);
+                return m ? m[0] : null;
+            })()
+        `).then(ip => {
+            if (ip) {
+                saveIp(account.id, ip);
+                ipBadge.className = "ip-badge ready";
+                ipBadge.textContent = `${ip}`;
+            } else {
+                ipBadge.className = "ip-badge loading";
+                ipBadge.textContent = `Tor :${account.torPort}`;
+            }
+        }).catch(() => {
+            ipBadge.className = "ip-badge loading";
+            ipBadge.textContent = `Tor :${account.torPort}`;
+        });
     });
 
     wv.addEventListener("did-fail-load", (e) => {
         if (e.errorCode === -3) return;
+        ipBadge.className = "ip-badge error";
+        ipBadge.textContent = `⚠ ${e.errorCode}`;
         reloadBtn.style.display = "flex";
         stopBtn.style.display = "none";
     });
@@ -754,14 +725,41 @@ function createAccountPanel(account) {
     cell.appendChild(wv);
     grid.appendChild(cell);
 
-    mc.getAccountHealth(account.id)
-        .then(statusState => updateAccountStatus(account.id, statusState))
-        .catch(error => console.error(`Falha ao carregar saúde da conta ${account.id}:`, error));
-
     // Desabilita back/fwd inicialmente
     backBtn.disabled = true;
     fwdBtn.disabled = true;
     
+    // ── Keyboard Shortcuts ──
+    const handleKeydown = (e) => {
+        if (e.ctrlKey || e.metaKey) {
+            if (e.key === 't' || e.key === 'T') {
+                e.preventDefault();
+                alert('Use o botão "+" na sidebar para adicionar uma nova conta');
+            } else if (e.key === 'w' || e.key === 'W') {
+                e.preventDefault();
+                removeBtn.click();
+            } else if (e.key === 'r' || e.key === 'R') {
+                e.preventDefault();
+                reloadBtn.click();
+            } else if (e.key === 'l' || e.key === 'L') {
+                e.preventDefault();
+                urlInput.focus();
+                urlInput.select();
+            } else if (e.key === 'k' || e.key === 'K') {
+                e.preventDefault();
+                // Força novo circuito
+                mc.newIdentity(account.id).catch(err => {
+                    console.error('Erro ao forçar novo circuito:', err);
+                });
+            } else if (e.key === 'd' || e.key === 'D') {
+                e.preventDefault();
+                // Abre DevTools
+                mc.openDevTools(account.id);
+            }
+        }
+    };
+
+    document.addEventListener('keydown', handleKeydown);
 }
 
 // Cria painéis, mas não carrega URLs de imediato
@@ -1078,11 +1076,14 @@ mc.onAccountRemoved(accountId => {
     syncOverviewOrder();
     delete webviews[accountId];
     delete ipBadges[accountId];
-    delete initialPageLoaders[accountId];
-    delete latestHealthUpdates[accountId];
-    navigationReadyAccounts.delete(accountId);
     updateOverviewGridLayout();
     applyVisibleAccounts();
+});
+
+document.addEventListener("keydown", (event) => {
+    if (event.key !== "F5") return;
+    event.preventDefault();
+    reloadAllAccounts();
 });
 
 // ══════════════════════════════════════════════════
@@ -1117,10 +1118,7 @@ function historyKey(accountId) {
 }
 
 function loadHistory(accountId, datalist) {
-    let saved = [];
-    try {
-        saved = JSON.parse(localStorage.getItem(historyKey(accountId)) || "[]").filter(isPersistableUrl);
-    } catch (_) {}
+    const saved = JSON.parse(localStorage.getItem(historyKey(accountId)) || "[]");
     datalist.innerHTML = "";
     saved.forEach(url => {
         const opt = document.createElement("option");
@@ -1130,7 +1128,7 @@ function loadHistory(accountId, datalist) {
 }
 
 function pushHistory(accountId, url, datalist) {
-    if (!isPersistableUrl(url)) return;
+    if (!url || url === "about:blank") return;
     const key = historyKey(accountId);
     let saved = JSON.parse(localStorage.getItem(key) || "[]");
     saved = saved.filter(u => u !== url);
@@ -1168,5 +1166,9 @@ document.getElementById("close-ip-dialog").addEventListener("click", () => {
 mc.onAccountHealth((statusState) => {
     const { accountId } = statusState;
     updateAccountStatus(accountId, statusState);
+    const cell = document.querySelector(`.cell[data-account-id="${accountId}"]`);
+    if (cell) {
+        cell.dataset.health = statusState.status || "unknown";
+    }
 });
 });

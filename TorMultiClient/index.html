@@ -2,8 +2,11 @@
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <title>hub-bliw</title>
+    <title>MultiClient — 4 IPs via Tor</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
     <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
         * {
             margin: 0;
             padding: 0;
@@ -39,7 +42,7 @@
             width: 100%;
             height: 100%;
             background: var(--bg);
-            font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+            font-family: 'Inter', -apple-system, sans-serif;
             overflow: hidden;
             color: var(--text);
         }
@@ -90,6 +93,12 @@
             letter-spacing: -0.5px;
         }
 
+        .splash-subtitle {
+            font-size: 13px;
+            color: var(--text3);
+            font-weight: 400;
+        }
+
         .splash-instances {
             display: flex;
             flex-direction: column;
@@ -109,7 +118,7 @@
             color: var(--text2);
             width: 60px;
             flex-shrink: 0;
-            font-family: ui-monospace, "Cascadia Mono", "Segoe UI Mono", Consolas, monospace;
+            font-family: 'JetBrains Mono', monospace;
         }
 
         .splash-bar-wrap {
@@ -143,7 +152,7 @@
 
         .splash-pct {
             font-size: 11px;
-            font-family: ui-monospace, "Cascadia Mono", "Segoe UI Mono", Consolas, monospace;
+            font-family: 'JetBrains Mono', monospace;
             color: var(--text3);
             width: 36px;
             text-align: right;
@@ -188,6 +197,19 @@
             white-space: nowrap;
         }
 
+        .topbar-sep {
+            width: 1px;
+            height: 18px;
+            background: var(--border2);
+            margin: 0 4px;
+        }
+
+        .topbar-info {
+            font-size: 11px;
+            color: var(--text3);
+            white-space: nowrap;
+        }
+
         .topbar-spacer { flex: 1; }
 
         /* Layout toggle buttons */
@@ -205,7 +227,7 @@
             font-size: 11px;
             cursor: pointer;
             transition: all 0.15s;
-            font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+            font-family: 'Inter', sans-serif;
         }
 
         .layout-btn:hover {
@@ -283,7 +305,7 @@
             color: var(--text2);
             cursor: pointer;
             text-align: left;
-            font: 500 12px system-ui, -apple-system, "Segoe UI", sans-serif;
+            font: 500 12px 'Inter', sans-serif;
         }
         .overview-btn:hover { color: var(--text); border-color: var(--accent); }
 
@@ -299,7 +321,7 @@
             color: var(--text2);
             cursor: pointer;
             text-align: left;
-            font: 500 12px system-ui, -apple-system, "Segoe UI", sans-serif;
+            font: 500 12px 'Inter', sans-serif;
         }
 
         .group-btn-main {
@@ -323,7 +345,7 @@
             white-space: nowrap;
         }
 
-        .group-btn small { color: var(--text3); font: 11px ui-monospace, "Cascadia Mono", "Segoe UI Mono", Consolas, monospace; }
+        .group-btn small { color: var(--text3); font: 11px 'JetBrains Mono', monospace; }
         .group-btn:hover { background: var(--bg3); color: var(--text); }
         .group-btn.active { background: rgba(124,111,255,.14); border-color: var(--accent2); color: var(--text); }
         .group-btn.active small { color: var(--accent); }
@@ -373,7 +395,7 @@
         }
 
         #sort-overview-btn,
-        #add-account-btn { width: 100%; margin: 8px 0 12px; padding: 7px 10px; border: 1px dashed var(--border2); border-radius: 5px; background: transparent; color: var(--text3); cursor: pointer; text-align: left; font: 500 11px system-ui, -apple-system, "Segoe UI", sans-serif; }
+        #add-account-btn { width: 100%; margin: 8px 0 12px; padding: 7px 10px; border: 1px dashed var(--border2); border-radius: 5px; background: transparent; color: var(--text3); cursor: pointer; text-align: left; font: 500 11px 'Inter', sans-serif; }
         #sort-overview-btn:hover,
         #add-account-btn:hover:not(:disabled) { color: var(--text); border-color: var(--accent); }
         #add-account-btn:disabled { opacity: .6; cursor: wait; }
@@ -403,7 +425,7 @@
             text-align: left;
             padding: 9px 12px;
             cursor: pointer;
-            font: 500 12px system-ui, -apple-system, "Segoe UI", sans-serif;
+            font: 500 12px 'Inter', sans-serif;
         }
 
         .group-menu-item:hover {
@@ -573,7 +595,7 @@
             outline: none;
             padding: 2px 5px;
             width: 80px;
-            font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+            font-family: 'Inter', sans-serif;
         }
 
         /* Botões de navegação */
@@ -625,7 +647,7 @@
             color: var(--text2);
             font-size: 11px;
             outline: none;
-            font-family: ui-monospace, "Cascadia Mono", "Segoe UI Mono", Consolas, monospace;
+            font-family: 'JetBrains Mono', monospace;
             transition: all 0.15s;
         }
 
@@ -638,7 +660,7 @@
         /* IP Badge */
         .ip-badge {
             font-size: 10px;
-            font-family: ui-monospace, "Cascadia Mono", "Segoe UI Mono", Consolas, monospace;
+            font-family: 'JetBrains Mono', monospace;
             padding: 3px 8px;
             border-radius: 99px;
             white-space: nowrap;
@@ -732,7 +754,7 @@
             pointer-events: none;
             transition: opacity 0.15s;
             border: 1px solid var(--border2);
-            font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+            font-family: 'Inter', sans-serif;
             z-index: 100;
         }
 
@@ -789,7 +811,7 @@
         .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; }
         .dialog-actions button { padding: 7px 11px; border: 1px solid var(--border2); border-radius: 4px; background: var(--bg3); color: var(--text2); cursor: pointer; }
         .dialog-actions button[type="submit"] { background: var(--accent2); border-color: var(--accent); color: white; }
-        .ip-list { margin: 0 0 16px 18px; color: var(--green); font: 13px ui-monospace, "Cascadia Mono", "Segoe UI Mono", Consolas, monospace; line-height: 1.8; }
+        .ip-list { margin: 0 0 16px 18px; color: var(--green); font: 13px 'JetBrains Mono', monospace; line-height: 1.8; }
         
         /* Bookmark Menu Styles */
         .bookmark-menu {
@@ -816,7 +838,8 @@
 <div id="splash">
     <div class="splash-logo">
         <div class="splash-onion">🧅</div>
-        <div class="splash-title">hub-bliw</div>
+        <div class="splash-title">MultiClient</div>
+        <div class="splash-subtitle">Iniciando instâncias Tor…</div>
     </div>
 
     <div class="splash-instances" id="splash-instances">
@@ -830,7 +853,9 @@
 <div id="app">
     <div id="topbar">
         <span class="topbar-logo">🧅</span>
-        <h1>hub-bliw</h1>
+        <h1>MultiClient</h1>
+        <div class="topbar-sep"></div>
+        <span class="topbar-info">Sessões isoladas · IPs independentes via Tor</span>
         <div class="topbar-spacer"></div>
         <div class="layout-btns">
             <button class="layout-btn active" id="btn-layout-2x2" data-layout="2x2" title="Grid 2×2">⊞ 2×2</button>

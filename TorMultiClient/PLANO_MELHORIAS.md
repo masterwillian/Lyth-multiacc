@@ -1,4 +1,4 @@
-# Plano de melhorias — hub-bliw
+# Plano de melhorias — TorMultiClient
 
 ## 1. Visão geral do projeto
 
@@ -18,11 +18,6 @@ A arquitetura atual já entrega a base funcional:
 
 No entanto, ele ainda é um protótipo funcional com muitos pontos de melhoria em estabilidade, observabilidade, organização e qualidade operacional.
 
-> Atualização v0.2.3: a navegação passou a operar em modo fail-closed. As sessões são
-> configuradas antes das webviews e só recebem tráfego externo depois da validação
-> do circuito, proxy e IP de saída pela sessão Chromium. A primeira navegação ignora
-> respostas antigas do cache.
-
 ---
 
 ## 2. O que o projeto consegue fazer hoje
@@ -36,7 +31,7 @@ Cada conta recebe:
 - um diretório de dados separado
 - um arquivo `torrc` próprio
 
-Essa arquitetura é o coração do projeto. Ela fornece uma instância Tor e uma sessão Electron isolada para cada conta, sem prometer endereços IP de saída diferentes.
+Essa arquitetura é correta e é o coração do projeto. Ela permite que cada conta tenha um circuito independente e uma identidade separada.
 
 ### 2.2 Sessões isoladas do Electron
 
@@ -76,7 +71,7 @@ A aplicação tem:
 A aplicação também faz:
 
 - User-Agent aleatório
-- IP de saída verificado pelo health-check através do proxy Tor
+- detecção de IP na página
 - registro de histórico de IP
 - bloqueio de domínios de anúncios/tracking
 - proteção superficial de canvas/WebGL
@@ -87,14 +82,9 @@ A aplicação também faz:
 
 ### 3.1 Falta de monitoramento real de saúde
 
-> Atualização v0.2.0: o monitoramento de processo, ControlPort autenticada,
-> circuito, proxy da sessão, saída SOCKS e recuperação automática foi
-> implementado. Consulte `HEALTH_CHECK.md`. Auditorias de WebRTC e DNS no
-> contexto das páginas continuam pendentes.
+Hoje o app inicia Tor e as sessões, mas não tem uma monitorização forte do estado de saúde de cada conta.
 
-Antes da v0.2.0, o app iniciava Tor e as sessões sem monitorização forte do estado de saúde de cada conta.
-
-Os cenários que motivaram a atualização eram:
+Problemas esperados:
 
 - instância Tor caiu e não foi reiniciada
 - porta de controle ficou indisponível

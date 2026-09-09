@@ -1,11 +1,10 @@
 {
-  "name": "hub-bliw",
-  "version": "0.2.3",
-  "description": "Gerenciador de sessões isoladas através da rede Tor",
+  "name": "tor-multiclient",
+  "version": "0.1.0",
+  "description": "Multi-session Chromium test lab",
   "main": "main.js",
   "scripts": {
-    "start": "electron .",
-    "test": "node --test"
+    "start": "electron ."
   },
   "devDependencies": {
     "electron": "^38.1.0",

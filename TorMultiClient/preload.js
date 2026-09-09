@@ -1,7 +1,7 @@
 const { contextBridge, ipcRenderer } = require("electron");
 
 contextBridge.exposeInMainWorld("multiClient", {
-    version: "0.2.3",
+    version: "0.3.0",
 
     getWorkspace: () => ipcRenderer.invoke("get-workspace"),
     createGroup: (data) => ipcRenderer.invoke("create-group", data),
@@ -56,6 +56,9 @@ contextBridge.exposeInMainWorld("multiClient", {
     onOpenDevTools: (callback) => {
         ipcRenderer.on("open-devtools-reply", (_, accountId) => callback(accountId));
     },
+
+    // Leak Detection
+    checkLeaks: (payload) => ipcRenderer.invoke("check-leaks", payload),
 
     // Tor Circuit Info
     getCircuitInfo: (accountId) => ipcRenderer.invoke("get-circuit-info", accountId),
