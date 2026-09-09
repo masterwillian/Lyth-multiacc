@@ -417,9 +417,18 @@ function createAccountPanel(account) {
         ipBadge.textContent = "Trocando IP…";
 
         try {
-            await mc.newIdentity(account.id);
-            // Dá tempo para o Tor criar o novo circuito antes da consulta.
-            await delay(4000);
+            const result = await mc.newIdentity(account.id);
+            if (result.verified && result.currentIP) {
+                saveIp(account.id, result.currentIP);
+                ipBadge.className = "ip-badge ready";
+                ipBadge.textContent = result.currentIP;
+                ipBadge.title = result.changed
+                    ? "Novo circuito confirmado com IP diferente"
+                    : "Novo circuito confirmado; o Tor manteve o mesmo exit relay";
+            } else {
+                ipBadge.className = "ip-badge error";
+                ipBadge.textContent = "⚠ IP não verificado";
+            }
             const wv = webviews[account.id];
             if (wv) wv.reloadIgnoringCache();
         } catch (e) {
@@ -489,7 +498,6 @@ function createAccountPanel(account) {
     const wv = document.createElement("webview");
     wv.setAttribute("partition", account.partition);
     wv.setAttribute("allowpopups", "");
-    wv.setAttribute("src", "about:blank");
     webviews[account.id] = wv;
     wv.dataset.initialUrl = urlInput.value;
 

@@ -7,8 +7,9 @@ const {
 
 const path = require("path");
 const fs   = require("fs");
-const net  = require("net");
 const { spawn } = require("child_process");
+const { queryTorStatus, signalNewIdentity } = require("./lib/tor-control");
+const { checkIpViaSocks } = require("./lib/socks-health");
 
 // ─────────────────────────────────────────────
 // Configuração persistente dos lotes e instâncias Tor
@@ -17,7 +18,12 @@ const TOR_EXE = path.join(__dirname, "..", "tor", "tor", "tor.exe");
 const TOR_DIR = path.join(__dirname, "..", "tor");
 const GROUPS_FILE = path.join(__dirname, "groups.json");
 const LOGS_DIR = path.join(__dirname, "logs");
-const HEALTH_CHECK_INTERVAL_MS = 15000;
+const CONTROL_HEALTH_INTERVAL_MS = 30000;
+const SOCKS_HEALTH_INTERVAL_MS = 120000;
+const HEALTH_FAILURE_THRESHOLD = 3;
+const HEALTH_JITTER_MS = 3000;
+const HEALTH_STAGGER_MS = 1500;
+const MAX_RESTART_BACKOFF_MS = 60000;
 
 let groups = JSON.parse(fs.readFileSync(GROUPS_FILE, "utf8")).groups;
 
@@ -68,29 +74,34 @@ function saveGroups() {
     fs.writeFileSync(GROUPS_FILE, JSON.stringify({ groups }, null, 2) + "\n");
 }
 
-function removeAccountRuntime(accountId) {
+async function removeAccountRuntime(accountId) {
+    intentionallyStoppedAccounts.add(accountId);
+
     const process = accountProcesses.get(accountId);
     if (process) {
+        expectedStoppedProcesses.add(process);
         try { process.kill(); } catch (_) {}
         accountProcesses.delete(accountId);
     }
 
     if (healthTimers.has(accountId)) {
-        clearInterval(healthTimers.get(accountId));
+        clearTimeout(healthTimers.get(accountId));
         healthTimers.delete(accountId);
     }
 
     const ses = accountSessions.get(accountId);
     if (ses) {
-        return ses.closeAllConnections().finally(() => {
-            accountSessions.delete(accountId);
-            accountHealth.delete(accountId);
-        });
+        if (ses.__cookieCleanupInterval) {
+            clearInterval(ses.__cookieCleanupInterval);
+            delete ses.__cookieCleanupInterval;
+        }
+        await ses.closeAllConnections().catch(() => {});
     }
 
     accountSessions.delete(accountId);
+    healthRuntime.delete(accountId);
+    recoveryPromises.delete(accountId);
     accountHealth.delete(accountId);
-    return Promise.resolve();
 }
 
 function ensureTorFiles(account) {
@@ -108,7 +119,7 @@ function ensureTorFiles(account) {
         `SocksPort 127.0.0.1:${account.torPort} IsolateClientAddr IsolateSOCKSAuth`,
         `DataDirectory ${dataDir}`,
         "",
-        "Log notice stdout",
+        "Log warn stdout",
         "",
         "MaxCircuitDirtiness 60",
         "NewCircuitPeriod 30",
@@ -134,7 +145,12 @@ const accountProcesses = new Map();
 const accountSessions = new Map();
 const accountHealth = new Map();
 const healthTimers = new Map();
+const healthRuntime = new Map();
+const recoveryPromises = new Map();
+const intentionallyStoppedAccounts = new Set();
+const expectedStoppedProcesses = new WeakSet();
 let mainWin = null;
+let appIsQuitting = false;
 
 function setAccountHealth(accountId, patch = {}) {
     const current = accountHealth.get(accountId) || {
@@ -142,6 +158,10 @@ function setAccountHealth(accountId, patch = {}) {
         status: "starting",
         message: "Aguardando bootstrap",
         bootstrapped: false,
+        circuitEstablished: false,
+        proxyConfigured: false,
+        controlFailures: 0,
+        socksFailures: 0,
         retries: 0,
         lastUpdated: Date.now()
     };
@@ -160,13 +180,28 @@ function setAccountHealth(accountId, patch = {}) {
         mainWin.webContents.send("account-health-update", payload);
     }
 
-    writeAccountLog(accountId, next.status === "error" ? "error" : "info", next.message, {
-        status: next.status,
-        bootstrapped: next.bootstrapped,
-        retries: next.retries,
-        torPort: next.torPort,
-        controlPort: next.controlPort,
-    });
+    const logFields = [
+        "status", "message", "bootstrapped", "circuitEstablished",
+        "proxyConfigured", "currentIP", "controlFailures", "socksFailures", "retries"
+    ];
+    const changed = logFields.some(field => current[field] !== next[field]);
+    if (changed) {
+        const level = next.status === "error"
+            ? "error"
+            : ["degraded", "recovering"].includes(next.status) ? "warn" : "info";
+        writeAccountLog(accountId, level, next.message, {
+            status: next.status,
+            bootstrapped: next.bootstrapped,
+            circuitEstablished: next.circuitEstablished,
+            proxyConfigured: next.proxyConfigured,
+            currentIP: next.currentIP,
+            controlFailures: next.controlFailures,
+            socksFailures: next.socksFailures,
+            retries: next.retries,
+            torPort: next.torPort,
+            controlPort: next.controlPort
+        });
+    }
 
     return next;
 }
@@ -177,116 +212,302 @@ function getAccountHealth(accountId) {
         status: "unknown",
         message: "Sem status disponível",
         bootstrapped: false,
+        circuitEstablished: false,
+        proxyConfigured: false,
+        controlFailures: 0,
+        socksFailures: 0,
         retries: 0,
         lastUpdated: Date.now()
     };
 }
 
-function registerHealthTimer(account) {
+function getHealthRuntime(accountId) {
+    if (!healthRuntime.has(accountId)) {
+        healthRuntime.set(accountId, {
+            checking: false,
+            controlFailures: 0,
+            socksFailures: 0,
+            restartAttempts: 0,
+            nextRestartAt: 0,
+            lastDeepCheckAt: 0,
+            lastIP: null
+        });
+    }
+    return healthRuntime.get(accountId);
+}
+
+function delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function nextHealthDelay() {
+    const jitter = Math.floor(Math.random() * (HEALTH_JITTER_MS * 2 + 1)) - HEALTH_JITTER_MS;
+    return CONTROL_HEALTH_INTERVAL_MS + jitter;
+}
+
+function scheduleHealthCheck(account, delayMs) {
     if (healthTimers.has(account.id)) {
-        clearInterval(healthTimers.get(account.id));
+        clearTimeout(healthTimers.get(account.id));
     }
 
-    const timer = setInterval(async () => {
-        const proc = accountProcesses.get(account.id);
-        const status = getAccountHealth(account.id);
-        const running = !!proc && proc.exitCode === null;
-
-        if (!running) {
-            const currentState = getAccountHealth(account.id);
-            if (currentState.status !== "recovering") {
-                setAccountHealth(account.id, {
-                    status: "degraded",
-                    message: "Tor fora do ar. Tentando recuperar...",
-                    bootstrapped: false,
-                    retries: (currentState.retries || 0) + 1
-                });
-            }
-
-            try {
-                await restartAccountRuntime(account);
-            } catch (error) {
-                setAccountHealth(account.id, {
-                    status: "error",
-                    message: error.message || "Falha ao recuperar Tor",
-                    bootstrapped: false,
-                    retries: (getAccountHealth(account.id).retries || 0) + 1
-                });
-                writeLog("error", `Recovery failed for account ${account.id}`, { accountId: account.id, error: error.message });
-            }
-            return;
-        }
-
-        const canConnect = await testTorControlPort(account.controlPort).catch(() => false);
-        if (!canConnect) {
-            setAccountHealth(account.id, {
-                status: status.bootstrapped ? "degraded" : "starting",
-                message: status.bootstrapped ? "ControlPort indisponível" : "Aguardando bootstrap",
-                bootstrapped: !!status.bootstrapped
+    const timer = setTimeout(async () => {
+        healthTimers.delete(account.id);
+        try {
+            await runAccountHealthCheck(account);
+        } catch (error) {
+            writeLog("error", "Unhandled account health-check error", {
+                accountId: account.id,
+                error: error.message
             });
-            return;
+        } finally {
+            if (!appIsQuitting && !intentionallyStoppedAccounts.has(account.id)) {
+                scheduleHealthCheck(account, nextHealthDelay());
+            }
         }
-
-        if (status.bootstrapped) {
-            setAccountHealth(account.id, {
-                status: "ready",
-                message: "Tor saudável e pronto",
-                bootstrapped: true
-            });
-        }
-    }, HEALTH_CHECK_INTERVAL_MS);
+    }, Math.max(0, delayMs));
 
     healthTimers.set(account.id, timer);
 }
 
-function testTorControlPort(port) {
-    return new Promise((resolve, reject) => {
-        const socket = net.createConnection({ host: "127.0.0.1", port }, () => {
-            socket.end();
-            resolve(true);
-        });
-
-        socket.on("error", reject);
-        socket.setTimeout(3000, () => {
-            socket.destroy();
-            reject(new Error("Timeout ao conectar no ControlPort"));
-        });
-    });
+function registerHealthTimer(account) {
+    intentionallyStoppedAccounts.delete(account.id);
+    const stagger = 5000 + (account.id % 10) * HEALTH_STAGGER_MS;
+    scheduleHealthCheck(account, stagger);
 }
 
-async function restartAccountRuntime(account) {
-    const existing = accountProcesses.get(account.id);
-    if (existing && existing.exitCode === null) {
-        return existing;
+async function verifySessionProxy(account) {
+    const ses = accountSessions.get(account.id);
+    if (!ses) return false;
+    const resolved = await ses.resolveProxy("https://example.com/");
+    return resolved.toUpperCase().includes("SOCKS") && resolved.includes(String(account.torPort));
+}
+
+async function runAccountHealthCheck(account, { forceDeep = false } = {}) {
+    const runtime = getHealthRuntime(account.id);
+    if (runtime.checking || recoveryPromises.has(account.id)) return getAccountHealth(account.id);
+    runtime.checking = true;
+
+    try {
+        const proc = accountProcesses.get(account.id);
+        if (!proc || proc.exitCode !== null) {
+            if (runtime.nextRestartAt > Date.now()) {
+                const seconds = Math.ceil((runtime.nextRestartAt - Date.now()) / 1000);
+                return setAccountHealth(account.id, {
+                    status: "error",
+                    message: `Aguardando ${seconds}s para nova tentativa de recuperação`,
+                    bootstrapped: false,
+                    circuitEstablished: false
+                });
+            }
+            setAccountHealth(account.id, {
+                status: "degraded",
+                message: "Processo Tor fora do ar",
+                bootstrapped: false,
+                circuitEstablished: false
+            });
+            await queueRecovery(account, "processo Tor encerrado", true);
+            return getAccountHealth(account.id);
+        }
+
+        let controlStatus;
+        try {
+            controlStatus = await queryTorStatus(account);
+        } catch (error) {
+            runtime.controlFailures += 1;
+            setAccountHealth(account.id, {
+                status: "degraded",
+                message: `ControlPort falhou (${runtime.controlFailures}/${HEALTH_FAILURE_THRESHOLD})`,
+                bootstrapped: false,
+                circuitEstablished: false,
+                controlFailures: runtime.controlFailures
+            });
+            if (runtime.controlFailures >= HEALTH_FAILURE_THRESHOLD) {
+                await queueRecovery(account, `ControlPort: ${error.message}`, true);
+            }
+            return getAccountHealth(account.id);
+        }
+
+        if (!controlStatus.bootstrapped || !controlStatus.circuitEstablished) {
+            runtime.controlFailures += 1;
+            setAccountHealth(account.id, {
+                status: "degraded",
+                message: controlStatus.bootstrapped ? "Tor ainda sem circuito estabelecido" : `Bootstrap em ${controlStatus.bootstrapProgress}%`,
+                bootstrapped: controlStatus.bootstrapped,
+                bootstrapProgress: controlStatus.bootstrapProgress,
+                circuitEstablished: controlStatus.circuitEstablished,
+                controlFailures: runtime.controlFailures
+            });
+            if (runtime.controlFailures >= HEALTH_FAILURE_THRESHOLD) {
+                await queueRecovery(account, "Tor sem circuito utilizável", true);
+            }
+            return getAccountHealth(account.id);
+        }
+
+        const proxyConfigured = await verifySessionProxy(account).catch(() => false);
+        if (!proxyConfigured) {
+            runtime.controlFailures += 1;
+            setAccountHealth(account.id, {
+                status: "degraded",
+                message: `Sessão sem o proxy esperado (${runtime.controlFailures}/${HEALTH_FAILURE_THRESHOLD})`,
+                bootstrapped: true,
+                circuitEstablished: true,
+                proxyConfigured: false,
+                controlFailures: runtime.controlFailures
+            });
+            if (runtime.controlFailures >= HEALTH_FAILURE_THRESHOLD) {
+                await queueRecovery(account, "proxy da sessão inconsistente", true);
+            }
+            return getAccountHealth(account.id);
+        }
+
+        runtime.controlFailures = 0;
+        const deepCheckDue = forceDeep || Date.now() - runtime.lastDeepCheckAt >= SOCKS_HEALTH_INTERVAL_MS;
+        if (deepCheckDue) {
+            runtime.lastDeepCheckAt = Date.now();
+            try {
+                runtime.lastIP = await checkIpViaSocks(account.torPort);
+                runtime.socksFailures = 0;
+            } catch (error) {
+                runtime.socksFailures += 1;
+                setAccountHealth(account.id, {
+                    status: "degraded",
+                    message: `Saída SOCKS5 falhou (${runtime.socksFailures}/${HEALTH_FAILURE_THRESHOLD})`,
+                    bootstrapped: true,
+                    circuitEstablished: true,
+                    proxyConfigured: true,
+                    controlFailures: 0,
+                    socksFailures: runtime.socksFailures
+                });
+                if (runtime.socksFailures >= HEALTH_FAILURE_THRESHOLD) {
+                    await queueRecovery(account, `SOCKS5: ${error.message}`, true);
+                }
+                return getAccountHealth(account.id);
+            }
+        }
+
+        if (runtime.socksFailures > 0) {
+            return setAccountHealth(account.id, {
+                status: "degraded",
+                message: `Saída SOCKS5 aguardando nova validação (${runtime.socksFailures}/${HEALTH_FAILURE_THRESHOLD})`,
+                bootstrapped: true,
+                circuitEstablished: true,
+                proxyConfigured: true,
+                controlFailures: 0,
+                socksFailures: runtime.socksFailures,
+                lastCheckedAt: Date.now()
+            });
+        }
+
+        return setAccountHealth(account.id, {
+            status: "ready",
+            message: runtime.lastIP ? `Tor saudável • IP ${runtime.lastIP}` : "Tor saudável e pronto",
+            bootstrapped: true,
+            bootstrapProgress: 100,
+            circuitEstablished: true,
+            proxyConfigured: true,
+            currentIP: runtime.lastIP,
+            controlFailures: 0,
+            socksFailures: 0,
+            lastCheckedAt: Date.now()
+        });
+    } finally {
+        runtime.checking = false;
+    }
+}
+
+function queueRecovery(account, reason, forceRestart = false) {
+    if (appIsQuitting || intentionallyStoppedAccounts.has(account.id)) return Promise.resolve(null);
+    if (recoveryPromises.has(account.id)) return recoveryPromises.get(account.id);
+
+    const recovery = restartAccountRuntime(account, reason, forceRestart)
+        .finally(() => recoveryPromises.delete(account.id));
+    recoveryPromises.set(account.id, recovery);
+    return recovery;
+}
+
+async function restartAccountRuntime(account, reason = "falha de saúde", forceRestart = false) {
+    const runtime = getHealthRuntime(account.id);
+    const waitMs = runtime.nextRestartAt - Date.now();
+    if (waitMs > 0) {
+        throw new Error(`Recuperação em espera por mais ${Math.ceil(waitMs / 1000)}s`);
     }
 
     setAccountHealth(account.id, {
         status: "recovering",
-        message: "Reconectando Tor e sessão",
+        message: `Recuperando conta: ${reason}`,
         bootstrapped: false,
+        circuitEstablished: false,
         retries: (getAccountHealth(account.id).retries || 0) + 1
     });
 
-    const existingSession = accountSessions.get(account.id);
-    if (existingSession) {
-        try {
-            await existingSession.closeAllConnections();
-        } catch (_) {}
-    }
+    try {
+        const existing = accountProcesses.get(account.id);
+        if (existing && existing.exitCode === null && forceRestart) {
+            expectedStoppedProcesses.add(existing);
+            try { existing.kill(); } catch (_) {}
+            await Promise.race([
+                new Promise(resolve => existing.once("exit", resolve)),
+                delay(3000)
+            ]);
+        } else if (existing && existing.exitCode === null) {
+            return existing;
+        }
 
-    const proc = await startTorInstance(account);
-    if (proc) {
+        const existingSession = accountSessions.get(account.id);
+        if (existingSession) {
+            await existingSession.closeAllConnections().catch(() => {});
+        }
+
+        const proc = await startTorInstance(account);
         await setupSession(account);
+        const control = await queryTorStatus(account);
+        if (!control.bootstrapped || !control.circuitEstablished) {
+            throw new Error("Tor reiniciou, mas ainda não possui circuito estabelecido");
+        }
+
+        runtime.controlFailures = 0;
+        runtime.socksFailures = 0;
+        runtime.restartAttempts = 0;
+        runtime.nextRestartAt = 0;
+        runtime.lastDeepCheckAt = 0;
         setAccountHealth(account.id, {
             status: "ready",
             message: "Tor recuperado com sucesso",
             bootstrapped: true,
-            retries: Math.max(0, (getAccountHealth(account.id).retries || 0) - 1)
+            bootstrapProgress: 100,
+            circuitEstablished: true,
+            proxyConfigured: true,
+            controlFailures: 0,
+            socksFailures: 0
         });
         return proc;
+    } catch (error) {
+        const failedProcess = accountProcesses.get(account.id);
+        if (failedProcess && failedProcess.exitCode === null) {
+            expectedStoppedProcesses.add(failedProcess);
+            try { failedProcess.kill(); } catch (_) {}
+            if (accountProcesses.get(account.id) === failedProcess) {
+                accountProcesses.delete(account.id);
+            }
+        }
+        runtime.restartAttempts += 1;
+        const backoff = Math.min(MAX_RESTART_BACKOFF_MS, 5000 * (2 ** (runtime.restartAttempts - 1)));
+        runtime.nextRestartAt = Date.now() + backoff;
+        setAccountHealth(account.id, {
+            status: "error",
+            message: `Recuperação falhou; nova tentativa em ${Math.ceil(backoff / 1000)}s`,
+            bootstrapped: false,
+            circuitEstablished: false,
+            retries: runtime.restartAttempts
+        });
+        writeLog("error", "Account recovery failed", {
+            accountId: account.id,
+            reason,
+            error: error.message,
+            retryInMs: backoff
+        });
+        throw error;
     }
-
-    throw new Error("Falha ao recuperar a instância Tor");
 }
 
 // ─────────────────────────────────────────────
@@ -319,78 +540,120 @@ function startTorInstance(account) {
         });
 
         let bootstrapped = false;
-        const timeout = setTimeout(() => {
-            if (!bootstrapped) {
-                const msg = `[Tor ${account.torPort}] Timeout ao aguardar bootstrap.`;
-                setAccountHealth(account.id, {
-                    status: "error",
-                    message: msg,
-                    bootstrapped: false
-                });
-                reject(new Error(msg));
-            }
-        }, 90000);
+        let settled = false;
+        let bootstrapTimer = null;
+
+        function finishBootstrap(error) {
+            if (settled) return;
+            settled = true;
+            if (bootstrapTimer) clearTimeout(bootstrapTimer);
+            if (error) reject(error);
+            else resolve(proc);
+        }
 
         function onData(chunk) {
             const line = chunk.toString();
             process.stdout.write(`[Tor ${account.torPort}] ${line}`);
 
-            const matchPct = line.match(/Bootstrapped (\d+)%/);
-            if (matchPct) {
-                const pct = parseInt(matchPct[1], 10);
-                if (mainWin && !mainWin.isDestroyed()) {
-                    mainWin.webContents.send("bootstrap-progress", { id: account.id, pct });
-                }
-
-                if (pct === 100 && !bootstrapped) {
-                    bootstrapped = true;
-                    clearTimeout(timeout);
-                    setAccountHealth(account.id, {
-                        status: "ready",
-                        message: "Tor pronto",
-                        bootstrapped: true
-                    });
-                    writeLog("info", `Tor instance ready`, { accountId: account.id, torPort: account.torPort });
-                    console.log(`[Tor ${account.torPort}] ✅ Pronto!`);
-                    resolve(proc);
-                }
-            }
-
             if (line.includes("[err]") || line.includes("[warn] Could not bind")) {
-                clearTimeout(timeout);
                 const msg = `[Tor ${account.torPort}] Erro: ${line.trim()}`;
                 setAccountHealth(account.id, {
                     status: "error",
                     message: msg,
                     bootstrapped: false
                 });
-                reject(new Error(msg));
+                finishBootstrap(new Error(msg));
             }
         }
 
         proc.stdout.on("data", onData);
         proc.stderr.on("data", onData);
+        proc.on("error", error => finishBootstrap(error));
 
         proc.on("exit", (code) => {
+            if (accountProcesses.get(account.id) === proc) {
+                accountProcesses.delete(account.id);
+            }
             if (!bootstrapped) {
-                clearTimeout(timeout);
                 const msg = `[Tor ${account.torPort}] Processo encerrou antes do bootstrap (code=${code})`;
-                setAccountHealth(account.id, {
-                    status: "error",
-                    message: msg,
-                    bootstrapped: false
-                });
-                reject(new Error(msg));
+                if (!appIsQuitting && !intentionallyStoppedAccounts.has(account.id) && !expectedStoppedProcesses.has(proc)) {
+                    setAccountHealth(account.id, {
+                        status: "error",
+                        message: msg,
+                        bootstrapped: false,
+                        circuitEstablished: false
+                    });
+                }
+                finishBootstrap(new Error(msg));
                 return;
             }
 
+            if (appIsQuitting || intentionallyStoppedAccounts.has(account.id) || expectedStoppedProcesses.has(proc)) return;
             setAccountHealth(account.id, {
                 status: "degraded",
                 message: "Instância Tor encerrou após bootstrap",
-                bootstrapped: false
+                bootstrapped: false,
+                circuitEstablished: false
             });
             writeLog("warn", `Tor process exited after bootstrap`, { accountId: account.id, code, torPort: account.torPort });
+            queueRecovery(account, "processo Tor encerrou inesperadamente", false).catch(() => {});
         });
+
+        const startedAt = Date.now();
+        async function pollBootstrap() {
+            if (settled || proc.exitCode !== null) return;
+            if (Date.now() - startedAt >= 90000) {
+                expectedStoppedProcesses.add(proc);
+                try { proc.kill(); } catch (_) {}
+                const msg = `[Tor ${account.torPort}] Timeout ao aguardar bootstrap.`;
+                setAccountHealth(account.id, {
+                    status: "error",
+                    message: msg,
+                    bootstrapped: false,
+                    circuitEstablished: false
+                });
+                finishBootstrap(new Error(msg));
+                return;
+            }
+
+            try {
+                const status = await queryTorStatus(account, 2500);
+                if (mainWin && !mainWin.isDestroyed()) {
+                    mainWin.webContents.send("bootstrap-progress", {
+                        id: account.id,
+                        pct: status.bootstrapProgress
+                    });
+                }
+                setAccountHealth(account.id, {
+                    status: "starting",
+                    message: `Bootstrap em ${status.bootstrapProgress}%`,
+                    bootstrapped: status.bootstrapped,
+                    bootstrapProgress: status.bootstrapProgress,
+                    circuitEstablished: status.circuitEstablished
+                });
+
+                if (status.bootstrapped && status.circuitEstablished) {
+                    bootstrapped = true;
+                    setAccountHealth(account.id, {
+                        status: "ready",
+                        message: "Tor pronto",
+                        bootstrapped: true,
+                        bootstrapProgress: 100,
+                        circuitEstablished: true
+                    });
+                    writeLog("info", "Tor instance ready", { accountId: account.id, torPort: account.torPort });
+                    console.log(`[Tor ${account.torPort}] ✅ Pronto!`);
+                    finishBootstrap(null);
+                    return;
+                }
+            } catch (_) {
+                // ControlPort/cookie ainda não estão disponíveis durante os primeiros segundos.
+            }
+
+            bootstrapTimer = setTimeout(pollBootstrap, 1000);
+        }
+
+        bootstrapTimer = setTimeout(pollBootstrap, 500);
     });
 }
 
@@ -491,6 +754,11 @@ async function setupSession(account) {
     const partition = `persist:account-${account.id}`;
     const ses = session.fromPartition(partition, { cache: true });
 
+    if (ses.__cookieCleanupInterval) {
+        clearInterval(ses.__cookieCleanupInterval);
+        delete ses.__cookieCleanupInterval;
+    }
+
     await ses.setProxy({
         mode: "fixed_servers",
         proxyRules: `socks5://127.0.0.1:${account.torPort}`,
@@ -502,13 +770,6 @@ async function setupSession(account) {
     // ── User-Agent Randomizer ──
     const randomUA = getRandomUserAgent();
     ses.setUserAgent(randomUA);
-
-    // ── DNS over HTTPS (DoH) via Custom Headers ──
-    ses.webRequest.onBeforeSendHeaders({ urls: ["<all_urls>"] }, (details, callback) => {
-        const headers = details.requestHeaders;
-        headers['DoH-User-Agent'] = 'tor-multiclient/1.0';
-        callback({ requestHeaders: headers });
-    });
 
     // ── Adblock: Bloqueia requisições de ad networks conhecidas ──
     const adDomains = new Set([
@@ -587,11 +848,6 @@ async function setupSession(account) {
         }
     });
 
-    // ── Canvas Fingerprinting Protection (injetado em cada página) ──
-    ses.setPreloads([
-        // Nota: Usamos webContents em vez de preload para evitar sandbox issues
-    ]);
-
     // ── Cookie Isolation & Auto-Cleanup ──
     // Limpa cookies a cada 30 minutos
     const cookieCleanupInterval = setInterval(async () => {
@@ -608,7 +864,7 @@ async function setupSession(account) {
     // Guarda o interval para cleanup quando a sessão for destruída
     ses.__cookieCleanupInterval = cookieCleanupInterval;
 
-    console.log(`[${account.name}] Sessão configurada → SOCKS5 127.0.0.1:${account.torPort} + DoH + UA Random + Canvas Protect + Adblock + CookieClean`);
+    console.log(`[${account.name}] Sessão configurada → SOCKS5 127.0.0.1:${account.torPort} + DNS via SOCKS + UA Random + Canvas Protect + Adblock + CookieClean`);
     accountSessions.set(account.id, ses);
     return ses;
 }
@@ -718,7 +974,10 @@ ipcMain.handle("create-group", async (_, { name, accountCount }) => {
             controlPort: account.controlPort,
             status: "ready",
             message: "Sessão ativa e pronta",
-            bootstrapped: true
+            bootstrapped: true,
+            bootstrapProgress: 100,
+            circuitEstablished: true,
+            proxyConfigured: true
         });
         registerHealthTimer(account);
     }));
@@ -804,7 +1063,10 @@ ipcMain.handle("add-account", async (_, groupId) => {
             controlPort: details.controlPort,
             status: "ready",
             message: "Sessão ativa e pronta",
-            bootstrapped: true
+            bootstrapped: true,
+            bootstrapProgress: 100,
+            circuitEstablished: true,
+            proxyConfigured: true
         });
         registerHealthTimer(details);
     } catch (error) {
@@ -851,56 +1113,64 @@ ipcMain.handle("get-circuit-info", (_, accountId) => {
 });
 
 ipcMain.handle("tor-new-identity", async (_, accountId) => {
-    return new Promise((resolve, reject) => {
-        const account = getAccounts().find(a => a.id === accountId);
-        if (!account) return reject(new Error("Conta não encontrada"));
+    const account = getAccounts().find(a => a.id === Number(accountId));
+    if (!account) throw new Error("Conta não encontrada");
 
-        const cookieFile = path.join(path.dirname(account.torrcFile), "data", "control_auth_cookie");
-        if (!fs.existsSync(cookieFile)) {
-            return reject(new Error("Cookie do Tor não encontrado. Reinicie a instância."));
-        }
-
-        const cookieHex = fs.readFileSync(cookieFile).toString("hex");
-
-        const sock = net.createConnection({ host: "127.0.0.1", port: account.controlPort }, () => {
-            sock.write(`AUTHENTICATE "${cookieHex}"\r\n`);
-        });
-
-        let response = "";
-        let authenticated = false;
-        let completed = false;
-        sock.on("data", d => { response += d.toString(); });
-        sock.on("data", async () => {
-            if (!authenticated && response.includes("250 OK")) {
-                authenticated = true;
-                response = "";
-                sock.write("SIGNAL NEWNYM\r\n");
-                return;
-            }
-
-            if (authenticated && !completed && response.includes("250 OK")) {
-                completed = true;
-                sock.write("QUIT\r\n");
-                sock.end();
-
-                const ses = accountSessions.get(account.id);
-                if (ses) await ses.closeAllConnections();
-
-                console.log(`[${account.name}] 🔄 New Identity confirmado; conexões fechadas`);
-                resolve(true);
-            }
-        });
-        sock.on("end", () => {
-            if (!completed) {
-                reject(new Error("ControlPort resposta inesperada: " + response.slice(0, 100)));
-            }
-        });
-        sock.on("error", reject);
-        sock.setTimeout(5000, () => {
-            sock.destroy();
-            reject(new Error("Timeout ControlPort"));
-        });
+    const runtime = getHealthRuntime(account.id);
+    const previousIP = runtime.lastIP || getAccountHealth(account.id).currentIP || null;
+    setAccountHealth(account.id, {
+        status: "recovering",
+        message: "Solicitando novo circuito Tor"
     });
+
+    await signalNewIdentity(account);
+    const ses = accountSessions.get(account.id);
+    if (ses) await ses.closeAllConnections();
+
+    // NEWNYM cria circuitos novos sob demanda e não garante um exit relay diferente.
+    await delay(5000);
+    let currentIP = null;
+    let verified = false;
+    try {
+        currentIP = await checkIpViaSocks(account.torPort);
+        verified = true;
+        runtime.lastIP = currentIP;
+        runtime.lastDeepCheckAt = Date.now();
+        runtime.socksFailures = 0;
+        setAccountHealth(account.id, {
+            status: "ready",
+            message: previousIP && currentIP === previousIP
+                ? `Circuito renovado • IP mantido ${currentIP}`
+                : `Novo circuito • IP ${currentIP}`,
+            currentIP,
+            bootstrapped: true,
+            circuitEstablished: true,
+            proxyConfigured: true,
+            socksFailures: 0
+        });
+    } catch (error) {
+        runtime.socksFailures += 1;
+        setAccountHealth(account.id, {
+            status: "degraded",
+            message: "Circuito solicitado, mas o novo IP não pôde ser verificado",
+            socksFailures: runtime.socksFailures
+        });
+    }
+
+    writeLog("info", "New identity requested", {
+        accountId: account.id,
+        previousIP,
+        currentIP,
+        verified,
+        changed: verified && !!previousIP && previousIP !== currentIP
+    });
+    return {
+        ok: true,
+        verified,
+        previousIP,
+        currentIP,
+        changed: verified && !!previousIP && previousIP !== currentIP
+    };
 });
 
 // ─────────────────────────────────────────────
@@ -919,14 +1189,23 @@ ipcMain.on("open-devtools", (event, accountId) => {
 // Encerramento limpo
 // ─────────────────────────────────────────────
 function killAllTor() {
+    appIsQuitting = true;
     console.log("\nEncerrando processos Tor...");
     for (const timer of healthTimers.values()) {
-        clearInterval(timer);
+        clearTimeout(timer);
     }
     healthTimers.clear();
-    for (const proc of torProcesses) {
+    for (const [accountId, ses] of accountSessions.entries()) {
+        intentionallyStoppedAccounts.add(accountId);
+        if (ses.__cookieCleanupInterval) clearInterval(ses.__cookieCleanupInterval);
+        ses.closeAllConnections().catch(() => {});
+    }
+    for (const [accountId, proc] of accountProcesses.entries()) {
+        intentionallyStoppedAccounts.add(accountId);
+        expectedStoppedProcesses.add(proc);
         try { proc.kill(); } catch (_) {}
     }
+    accountProcesses.clear();
     torProcesses.length = 0;
 }
 
@@ -981,7 +1260,10 @@ app.whenReady().then(async () => {
             controlPort: account.controlPort,
             status: "ready",
             message: "Sessão ativa e pronta",
-            bootstrapped: true
+            bootstrapped: true,
+            bootstrapProgress: 100,
+            circuitEstablished: true,
+            proxyConfigured: true
         });
         registerHealthTimer(account);
     }
@@ -991,78 +1273,4 @@ app.whenReady().then(async () => {
         mainWin.webContents.send("tor-boot-complete");
     }
 
-    // 6. Verifica IPs no console (log lateral)
-    console.log("\n🔍 Verificando IPs das 4 sessões...\n");
-    for (const account of accounts) {
-        try {
-            const ip = await checkIPviaSocks(account.torPort);
-            console.log(`  [${account.name}] IP público: ${ip}`);
-        } catch (e) {
-            console.log(`  [${account.name}] Não foi possível checar IP: ${e.message}`);
-        }
-    }
 });
-
-// ─────────────────────────────────────────────
-// Verifica IP via SOCKS5 (Node.js side)
-// ─────────────────────────────────────────────
-function checkIPviaSocks(port) {
-    return new Promise((resolve, reject) => {
-        const socket = net.createConnection({ host: "127.0.0.1", port }, () => {
-            socket.write(Buffer.from([0x05, 0x01, 0x00]));
-        });
-
-        let step = 0;
-        socket.on("data", (data) => {
-            if (step === 0) {
-                if (data[0] === 0x05 && data[1] === 0x00) {
-                    step = 1;
-                    const host = "api.ipify.org";
-                    const hostBuf = Buffer.from(host);
-                    const req = Buffer.alloc(7 + hostBuf.length);
-                    req[0] = 0x05; req[1] = 0x01; req[2] = 0x00; req[3] = 0x03;
-                    req[4] = hostBuf.length;
-                    hostBuf.copy(req, 5);
-                    req.writeUInt16BE(443, 5 + hostBuf.length);
-                    socket.write(req);
-                }
-            } else if (step === 1) {
-                if (data[1] === 0x00) {
-                    const tlsSocket = require("tls").connect({
-                        socket,
-                        servername: "api.ipify.org",
-                        rejectUnauthorized: true
-                    }, () => {
-                        tlsSocket.write(
-                            "GET /?format=json HTTP/1.1\r\n" +
-                            "Host: api.ipify.org\r\n" +
-                            "Connection: close\r\n\r\n"
-                        );
-                    });
-
-                    let body = "";
-                    tlsSocket.on("data", d => body += d.toString());
-                    tlsSocket.on("end", () => {
-                        try {
-                            const json = JSON.parse(body.split("\r\n\r\n")[1]);
-                            resolve(json.ip);
-                        } catch {
-                            reject(new Error("Resposta inválida: " + body.slice(0, 100)));
-                        }
-                    });
-                    tlsSocket.on("error", reject);
-                    step = 2;
-                } else {
-                    reject(new Error(`SOCKS5 erro: código ${data[1]}`));
-                    socket.destroy();
-                }
-            }
-        });
-
-        socket.on("error", reject);
-        socket.setTimeout(20000, () => {
-            socket.destroy();
-            reject(new Error("Timeout SOCKS5"));
-        });
-    });
-}

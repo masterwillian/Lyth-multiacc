@@ -25,3 +25,5 @@ O projeto ainda é um protótipo funcional. Consulte
 `TorMultiClient/PLANO_MELHORIAS.md` para conhecer as limitações atuais e o
 roadmap sugerido.
 
+O funcionamento e os estados do monitoramento de cada instância estão descritos
+em `TorMultiClient/HEALTH_CHECK.md`.

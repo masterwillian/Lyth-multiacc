@@ -1,10 +1,11 @@
 {
   "name": "tor-multiclient",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Multi-session Chromium test lab",
   "main": "main.js",
   "scripts": {
-    "start": "electron ."
+    "start": "electron .",
+    "test": "node --test"
   },
   "devDependencies": {
     "electron": "^38.1.0",

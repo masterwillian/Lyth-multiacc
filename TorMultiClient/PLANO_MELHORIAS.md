@@ -82,9 +82,14 @@ A aplicação também faz:
 
 ### 3.1 Falta de monitoramento real de saúde
 
-Hoje o app inicia Tor e as sessões, mas não tem uma monitorização forte do estado de saúde de cada conta.
+> Atualização v0.2.0: o monitoramento de processo, ControlPort autenticada,
+> circuito, proxy da sessão, saída SOCKS e recuperação automática foi
+> implementado. Consulte `HEALTH_CHECK.md`. Auditorias de WebRTC e DNS no
+> contexto das páginas continuam pendentes.
 
-Problemas esperados:
+Antes da v0.2.0, o app iniciava Tor e as sessões sem monitorização forte do estado de saúde de cada conta.
+
+Os cenários que motivaram a atualização eram:
 
 - instância Tor caiu e não foi reiniciada
 - porta de controle ficou indisponível
