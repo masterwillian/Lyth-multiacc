@@ -22,3 +22,5 @@ tor/instance*/
 Thumbs.db
 Desktop.ini
 
+# Local bridge to the external Obsidian knowledge vault
+.memory/
