@@ -178,13 +178,9 @@ mc.onBootComplete(() => {
     appBootCompleted = true;
     splashStatus.textContent = "✅ Todos prontos! Carregando…";
     
-    // Carrega URLs nas webviews agora que o proxy está pronto
-    Object.keys(webviews).forEach(accountId => {
-        const wv = webviews[accountId];
-        const initialUrl = wv.dataset.initialUrl;
-        if (wv && initialUrl) {
-            wv.src = initialUrl;
-        }
+    // Cada webview só navega depois que o guest about:blank estiver pronto.
+    Object.keys(initialPageLoaders).forEach(accountId => {
+        initialPageLoaders[accountId]();
     });
     
     setTimeout(() => {
@@ -272,6 +268,29 @@ function applyVisibleAccounts() {
 // Referências globais por conta (para New Identity e DevTools)
 const webviews = {};
 const ipBadges = {};
+const initialPageLoaders = {};
+const DEFAULT_START_URL = "https://checkip.amazonaws.com/";
+
+function isPersistableUrl(url) {
+    return typeof url === "string" && (url.startsWith("https://") || url.startsWith("http://"));
+}
+
+function getInitialAccountUrl(accountId) {
+    const savedUrl = localStorage.getItem(`account-url-${accountId}`);
+    if (isPersistableUrl(savedUrl)) return savedUrl;
+
+    try {
+        const history = JSON.parse(localStorage.getItem(historyKey(accountId)) || "[]");
+        const recoveredUrl = history.find(isPersistableUrl);
+        if (recoveredUrl) {
+            localStorage.setItem(`account-url-${accountId}`, recoveredUrl);
+            return recoveredUrl;
+        }
+    } catch (_) {}
+
+    localStorage.setItem(`account-url-${accountId}`, DEFAULT_START_URL);
+    return DEFAULT_START_URL;
+}
 
 function updateAccountStatus(accountId, statusState) {
     const indicator = document.querySelector(`.account-status[data-account-id="${accountId}"]`);
@@ -376,7 +395,7 @@ function createAccountPanel(account) {
     const urlInput = document.createElement("input");
     urlInput.className = "cell-url";
     urlInput.type = "text";
-    urlInput.value = localStorage.getItem(`account-url-${account.id}`) || "https://checkip.amazonaws.com/";
+    urlInput.value = getInitialAccountUrl(account.id);
     urlInput.placeholder = "https://...";
     urlInput.setAttribute("list", listId);
 
@@ -498,8 +517,31 @@ function createAccountPanel(account) {
     const wv = document.createElement("webview");
     wv.setAttribute("partition", account.partition);
     wv.setAttribute("allowpopups", "");
+    wv.setAttribute("src", "about:blank");
     webviews[account.id] = wv;
     wv.dataset.initialUrl = urlInput.value;
+
+    let guestReady = false;
+    let initialNavigationStarted = false;
+    function loadInitialPage() {
+        // O dom-ready inicial pode ocorrer antes do listener em versões do Electron.
+        if (!guestReady && wv.getURL() === "about:blank") guestReady = true;
+        if (!appBootCompleted || !guestReady || initialNavigationStarted) return;
+        const initialUrl = wv.dataset.initialUrl;
+        if (!initialUrl) return;
+        initialNavigationStarted = true;
+        wv.loadURL(initialUrl).catch(error => {
+            initialNavigationStarted = false;
+            console.error(`Não foi possível carregar a URL inicial da conta ${account.id}:`, error);
+        });
+    }
+    initialPageLoaders[account.id] = loadInitialPage;
+    wv.addEventListener("dom-ready", () => {
+        if (!initialNavigationStarted && wv.getURL() === "about:blank") {
+            guestReady = true;
+            loadInitialPage();
+        }
+    });
 
     // — Navegação —
     function navigate() {
@@ -524,13 +566,14 @@ function createAccountPanel(account) {
 
     // — Atualiza URL bar ao navegar —
     wv.addEventListener("did-navigate", e => {
+        if (!isPersistableUrl(e.url)) return;
         urlInput.value = e.url;
         localStorage.setItem(`account-url-${account.id}`, e.url);
         pushHistory(account.id, e.url, datalist);
     });
 
     wv.addEventListener("did-navigate-in-page", e => {
-        if (e.isMainFrame) {
+        if (e.isMainFrame && isPersistableUrl(e.url)) {
             urlInput.value = e.url;
             localStorage.setItem(`account-url-${account.id}`, e.url);
             pushHistory(account.id, e.url, datalist);
@@ -1084,6 +1127,7 @@ mc.onAccountRemoved(accountId => {
     syncOverviewOrder();
     delete webviews[accountId];
     delete ipBadges[accountId];
+    delete initialPageLoaders[accountId];
     updateOverviewGridLayout();
     applyVisibleAccounts();
 });
@@ -1126,7 +1170,10 @@ function historyKey(accountId) {
 }
 
 function loadHistory(accountId, datalist) {
-    const saved = JSON.parse(localStorage.getItem(historyKey(accountId)) || "[]");
+    let saved = [];
+    try {
+        saved = JSON.parse(localStorage.getItem(historyKey(accountId)) || "[]").filter(isPersistableUrl);
+    } catch (_) {}
     datalist.innerHTML = "";
     saved.forEach(url => {
         const opt = document.createElement("option");
@@ -1136,7 +1183,7 @@ function loadHistory(accountId, datalist) {
 }
 
 function pushHistory(accountId, url, datalist) {
-    if (!url || url === "about:blank") return;
+    if (!isPersistableUrl(url)) return;
     const key = historyKey(accountId);
     let saved = JSON.parse(localStorage.getItem(key) || "[]");
     saved = saved.filter(u => u !== url);

@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.1 — 2026-09-08
+
+### Navegação e persistência
+
+- Corrigida regressão que mantinha as webviews em `about:blank` após o boot.
+- A navegação inicial agora aguarda o guest da webview estar pronto.
+- URLs internas, como `about:blank`, não sobrescrevem mais a última URL da conta.
+- Contas afetadas recuperam automaticamente a URL mais recente do histórico.
+- Quando não existe URL recuperável, a conta volta ao endereço padrão de verificação.
+- Histórico e URL persistida voltaram a ser atualizados por navegações HTTP/HTTPS.
+
 ## 0.2.0 — 2026-09-08
 
 ### Health-check

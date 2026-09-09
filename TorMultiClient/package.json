@@ -1,6 +1,6 @@
 {
   "name": "tor-multiclient",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Multi-session Chromium test lab",
   "main": "main.js",
   "scripts": {
