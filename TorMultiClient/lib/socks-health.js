@@ -24,7 +24,7 @@ function checkIpViaSocks(port, timeoutMs = 15000) {
 
         const request = https.get("https://api.ipify.org/?format=json", {
             agent,
-            headers: { "User-Agent": "TorMultiClient-health/0.2" }
+            headers: { "User-Agent": "hub-bliw-health/0.2" }
         }, response => {
             let body = "";
             response.setEncoding("utf8");

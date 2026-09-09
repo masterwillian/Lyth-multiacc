@@ -870,13 +870,13 @@ async function setupSession(account) {
 }
 
 // ─────────────────────────────────────────────
-// Janela principal (Splash + Grid 2×2)
+// Janela principal (splash + painel de sessões)
 // ─────────────────────────────────────────────
 function createMainWindow() {
     const win = new BrowserWindow({
         width: 1600,
         height: 950,
-        title: "MultiClient — 4 IPs separados via Tor",
+        title: "hub-bliw",
         backgroundColor: "#0f0f0f",
         webPreferences: {
             preload: path.join(__dirname, "preload.js"),
@@ -887,34 +887,13 @@ function createMainWindow() {
         }
     });
 
+    win.removeMenu();
     win.loadFile(path.join(__dirname, "index.html"));
     return win;
 }
 
 // ─────────────────────────────────────────────
 // IPC — dados das contas para o renderer
-// ─────────────────────────────────────────────
-// ─────────────────────────────────────────────
-// Leak Detection — Verifica vazamento de IP/DNS
-// ─────────────────────────────────────────────
-function checkForLeaks(accountId, currentIP) {
-    const account = getAccounts().find(a => a.id === accountId);
-    if (!account) return null;
-
-    // IP esperado é o Tor IP (mudaria após New Identity)
-    // Vazamento seria qualquer IP que não seja Tor
-    // Para simplificar, apenas logamos anomalias
-    const leakStatus = {
-        accountId,
-        currentIP,
-        torPort: account.torPort,
-        hasLeak: false,
-        message: 'OK - Protegido pelo Tor'
-    };
-
-    return leakStatus;
-}
-
 ipcMain.handle("get-account-info", () => {
     return getAccounts().map(a => ({
         id: a.id,
@@ -930,11 +909,6 @@ ipcMain.handle("get-account-info", () => {
 ipcMain.handle("get-account-health", (_, accountId) => {
     const resolvedId = Number(accountId);
     return getAccountHealth(resolvedId);
-});
-
-// ── Leak Detection IPC ──
-ipcMain.handle("check-leaks", (_, { accountId, currentIP }) => {
-    return checkForLeaks(accountId, currentIP);
 });
 
 ipcMain.handle("get-workspace", () => ({
@@ -1120,12 +1094,26 @@ ipcMain.handle("tor-new-identity", async (_, accountId) => {
     const previousIP = runtime.lastIP || getAccountHealth(account.id).currentIP || null;
     setAccountHealth(account.id, {
         status: "recovering",
-        message: "Solicitando novo circuito Tor"
+        message: "Solicitando novo circuito Tor",
+        currentIP: null
     });
 
-    await signalNewIdentity(account);
-    const ses = accountSessions.get(account.id);
-    if (ses) await ses.closeAllConnections();
+    try {
+        await signalNewIdentity(account);
+        const ses = accountSessions.get(account.id);
+        if (ses) await ses.closeAllConnections();
+    } catch (error) {
+        setAccountHealth(account.id, {
+            status: "degraded",
+            message: "Não foi possível solicitar um novo circuito Tor",
+            currentIP: null
+        });
+        writeLog("error", "New identity request failed", {
+            accountId: account.id,
+            error: error.message
+        });
+        throw error;
+    }
 
     // NEWNYM cria circuitos novos sob demanda e não garante um exit relay diferente.
     await delay(5000);
@@ -1153,6 +1141,7 @@ ipcMain.handle("tor-new-identity", async (_, accountId) => {
         setAccountHealth(account.id, {
             status: "degraded",
             message: "Circuito solicitado, mas o novo IP não pôde ser verificado",
+            currentIP: null,
             socksFailures: runtime.socksFailures
         });
     }
@@ -1222,7 +1211,7 @@ app.on("window-all-closed", () => {
 // ─────────────────────────────────────────────
 app.whenReady().then(async () => {
     console.log("==============================================");
-    console.log("        MULTICLIENT — BOOT");
+    console.log("        HUB-BLIW — BOOT");
     console.log("==============================================\n");
 
     // 1. Abre a janela principal imediatamente (com splash screen)

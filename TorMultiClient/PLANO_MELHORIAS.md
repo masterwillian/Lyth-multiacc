@@ -1,4 +1,4 @@
-# Plano de melhorias — TorMultiClient
+# Plano de melhorias — hub-bliw
 
 ## 1. Visão geral do projeto
 
@@ -31,7 +31,7 @@ Cada conta recebe:
 - um diretório de dados separado
 - um arquivo `torrc` próprio
 
-Essa arquitetura é correta e é o coração do projeto. Ela permite que cada conta tenha um circuito independente e uma identidade separada.
+Essa arquitetura é o coração do projeto. Ela fornece uma instância Tor e uma sessão Electron isolada para cada conta, sem prometer endereços IP de saída diferentes.
 
 ### 2.2 Sessões isoladas do Electron
 
@@ -71,7 +71,7 @@ A aplicação tem:
 A aplicação também faz:
 
 - User-Agent aleatório
-- detecção de IP na página
+- IP de saída verificado pelo health-check através do proxy Tor
 - registro de histórico de IP
 - bloqueio de domínios de anúncios/tracking
 - proteção superficial de canvas/WebGL

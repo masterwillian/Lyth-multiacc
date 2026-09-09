@@ -20,6 +20,6 @@ if not exist "%~dp0node_modules" (
     )
 )
 
-echo Iniciando TorMultiClient...
+echo Iniciando hub-bliw...
 call npm start
 exit /b %errorlevel%

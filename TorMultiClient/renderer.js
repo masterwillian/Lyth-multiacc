@@ -77,21 +77,6 @@ function reorderOverview(sourceId, targetId) {
 
 let appBootCompleted = false;
 
-function reloadAllAccounts() {
-    if (!appBootCompleted) return;
-
-    const webviewEntries = Object.entries(webviews);
-    if (!webviewEntries.length) return;
-
-    webviewEntries.forEach(([accountId, wv]) => {
-        if (wv && typeof wv.reload === "function" && !wv.isLoading()) {
-            try {
-                wv.reload();
-            } catch (_) {}
-        }
-    });
-}
-
 function applyGroupAccent(element, groupId) {
     const color = getGroupColor(groupId);
     element.style.setProperty("--group-accent", color);
@@ -195,18 +180,6 @@ mc.onBootError((msg) => {
 });
 
 // ══════════════════════════════════════════════════
-// KEYBOARD SHORTCUTS HELP
-// ══════════════════════════════════════════════════
-console.log(`
-🎮 Keyboard Shortcuts:
-  Ctrl+L  — Focar URL bar
-  Ctrl+R  — Recarregar página
-  Ctrl+W  — Remover conta
-  Ctrl+K  — Forçar novo circuito Tor
-  Ctrl+D  — Abrir DevTools
-`);
-
-// ══════════════════════════════════════════════════
 // LAYOUT TOGGLE
 // ══════════════════════════════════════════════════
 
@@ -269,6 +242,7 @@ function applyVisibleAccounts() {
 const webviews = {};
 const ipBadges = {};
 const initialPageLoaders = {};
+const latestHealthUpdates = {};
 const DEFAULT_START_URL = "https://checkip.amazonaws.com/";
 
 function isPersistableUrl(url) {
@@ -293,8 +267,13 @@ function getInitialAccountUrl(accountId) {
 }
 
 function updateAccountStatus(accountId, statusState) {
+    const incomingTimestamp = Number(statusState.lastUpdated) || 0;
+    if (incomingTimestamp && incomingTimestamp < (latestHealthUpdates[accountId] || 0)) return;
+    latestHealthUpdates[accountId] = incomingTimestamp;
+
     const indicator = document.querySelector(`.account-status[data-account-id="${accountId}"]`);
     const label = document.querySelector(`.account-status-label[data-account-id="${accountId}"]`);
+    const cell = document.querySelector(`.cell[data-account-id="${accountId}"]`);
     if (indicator) {
         indicator.className = `account-status status-${statusState.status || "unknown"}`;
         indicator.title = statusState.message || "Sem status";
@@ -302,6 +281,27 @@ function updateAccountStatus(accountId, statusState) {
     if (label) {
         label.textContent = statusState.message || "Sem status";
     }
+    if (cell) {
+        cell.dataset.health = statusState.status || "unknown";
+    }
+
+    const ipBadge = ipBadges[accountId];
+    if (!ipBadge) return;
+
+    if (statusState.currentIP) {
+        saveIp(accountId, statusState.currentIP);
+        ipBadge.className = "ip-badge ready";
+        ipBadge.textContent = statusState.currentIP;
+        ipBadge.title = "IP confirmado pelo health-check através do proxy Tor";
+        return;
+    }
+
+    const account = accounts.find(item => item.id === Number(accountId));
+    ipBadge.className = ["error", "degraded"].includes(statusState.status)
+        ? "ip-badge error"
+        : "ip-badge loading";
+    ipBadge.textContent = account ? `Tor :${account.torPort}` : "IP não verificado";
+    ipBadge.title = "Aguardando verificação do IP pelo health-check";
 }
 
 function createAccountPanel(account) {
@@ -432,27 +432,11 @@ function createAccountPanel(account) {
         if (newIdBtn.disabled) return;
         newIdBtn.disabled = true;
         newIdBtn.classList.add("spinning");
-        ipBadge.className = "ip-badge spinning";
-        ipBadge.textContent = "Trocando IP…";
-
         try {
-            const result = await mc.newIdentity(account.id);
-            if (result.verified && result.currentIP) {
-                saveIp(account.id, result.currentIP);
-                ipBadge.className = "ip-badge ready";
-                ipBadge.textContent = result.currentIP;
-                ipBadge.title = result.changed
-                    ? "Novo circuito confirmado com IP diferente"
-                    : "Novo circuito confirmado; o Tor manteve o mesmo exit relay";
-            } else {
-                ipBadge.className = "ip-badge error";
-                ipBadge.textContent = "⚠ IP não verificado";
-            }
+            await mc.newIdentity(account.id);
             const wv = webviews[account.id];
             if (wv) wv.reloadIgnoringCache();
         } catch (e) {
-            ipBadge.className = "ip-badge error";
-            ipBadge.textContent = "⚠ ControlPort";
             console.error("New Identity error:", e);
         } finally {
             newIdBtn.disabled = false;
@@ -506,7 +490,7 @@ function createAccountPanel(account) {
     actionBtns.append(newIdBtn, ipHistoryBtn, devBtn, focusBtn, removeBtn);
 
     // — Monta barra —
-    bar.append(label, navBtns, urlWrap, ipBadge, actionBtns);
+    bar.append(label, statusWrap, navBtns, urlWrap, ipBadge, actionBtns);
 
     // ── Progress bar de carregamento de página ──
     const pageProgress = document.createElement("div");
@@ -600,7 +584,7 @@ function createAccountPanel(account) {
         fwdBtn.disabled   = !wv.canGoForward();
     });
 
-    // — Detecção de IP + Canvas Fingerprinting Protection ──
+    // — Proteção básica contra fingerprinting de canvas/WebGL ──
     wv.addEventListener("did-finish-load", () => {
         // Injeta proteção contra Canvas Fingerprinting
         const canvasProtectionScript = `
@@ -655,36 +639,10 @@ function createAccountPanel(account) {
             console.log('Canvas protection injection skipped');
         }
 
-        // Detecção de IP
-        wv.executeJavaScript(`
-            (() => {
-                const txt = document.body ? document.body.innerText.trim() : "";
-                try {
-                    const obj = JSON.parse(txt);
-                    if (obj.ip) return obj.ip;
-                } catch (_) {}
-                const m = txt.match(/\\b(\\d{1,3}\\.){3}\\d{1,3}\\b/);
-                return m ? m[0] : null;
-            })()
-        `).then(ip => {
-            if (ip) {
-                saveIp(account.id, ip);
-                ipBadge.className = "ip-badge ready";
-                ipBadge.textContent = `${ip}`;
-            } else {
-                ipBadge.className = "ip-badge loading";
-                ipBadge.textContent = `Tor :${account.torPort}`;
-            }
-        }).catch(() => {
-            ipBadge.className = "ip-badge loading";
-            ipBadge.textContent = `Tor :${account.torPort}`;
-        });
     });
 
     wv.addEventListener("did-fail-load", (e) => {
         if (e.errorCode === -3) return;
-        ipBadge.className = "ip-badge error";
-        ipBadge.textContent = `⚠ ${e.errorCode}`;
         reloadBtn.style.display = "flex";
         stopBtn.style.display = "none";
     });
@@ -776,41 +734,14 @@ function createAccountPanel(account) {
     cell.appendChild(wv);
     grid.appendChild(cell);
 
+    mc.getAccountHealth(account.id)
+        .then(statusState => updateAccountStatus(account.id, statusState))
+        .catch(error => console.error(`Falha ao carregar saúde da conta ${account.id}:`, error));
+
     // Desabilita back/fwd inicialmente
     backBtn.disabled = true;
     fwdBtn.disabled = true;
     
-    // ── Keyboard Shortcuts ──
-    const handleKeydown = (e) => {
-        if (e.ctrlKey || e.metaKey) {
-            if (e.key === 't' || e.key === 'T') {
-                e.preventDefault();
-                alert('Use o botão "+" na sidebar para adicionar uma nova conta');
-            } else if (e.key === 'w' || e.key === 'W') {
-                e.preventDefault();
-                removeBtn.click();
-            } else if (e.key === 'r' || e.key === 'R') {
-                e.preventDefault();
-                reloadBtn.click();
-            } else if (e.key === 'l' || e.key === 'L') {
-                e.preventDefault();
-                urlInput.focus();
-                urlInput.select();
-            } else if (e.key === 'k' || e.key === 'K') {
-                e.preventDefault();
-                // Força novo circuito
-                mc.newIdentity(account.id).catch(err => {
-                    console.error('Erro ao forçar novo circuito:', err);
-                });
-            } else if (e.key === 'd' || e.key === 'D') {
-                e.preventDefault();
-                // Abre DevTools
-                mc.openDevTools(account.id);
-            }
-        }
-    };
-
-    document.addEventListener('keydown', handleKeydown);
 }
 
 // Cria painéis, mas não carrega URLs de imediato
@@ -1128,14 +1059,9 @@ mc.onAccountRemoved(accountId => {
     delete webviews[accountId];
     delete ipBadges[accountId];
     delete initialPageLoaders[accountId];
+    delete latestHealthUpdates[accountId];
     updateOverviewGridLayout();
     applyVisibleAccounts();
-});
-
-document.addEventListener("keydown", (event) => {
-    if (event.key !== "F5") return;
-    event.preventDefault();
-    reloadAllAccounts();
 });
 
 // ══════════════════════════════════════════════════
@@ -1221,9 +1147,5 @@ document.getElementById("close-ip-dialog").addEventListener("click", () => {
 mc.onAccountHealth((statusState) => {
     const { accountId } = statusState;
     updateAccountStatus(accountId, statusState);
-    const cell = document.querySelector(`.cell[data-account-id="${accountId}"]`);
-    if (cell) {
-        cell.dataset.health = statusState.status || "unknown";
-    }
 });
 });
