@@ -51,8 +51,8 @@ manager remains a prerequisite for a later `WebContentsView` migration.
 
 ## Deferred phases
 
-SQLite migration, persistent profile identity, a full runtime state machine,
-layered route health checks, explicit profile-data maintenance, browser-engine
+SQLite migration, persistent profile identity, layered route health checks,
+explicit profile-data maintenance, browser-engine
 abstraction, and broader integration tests remain intentionally deferred until
 this stabilization phase has been exercised on Windows.
 

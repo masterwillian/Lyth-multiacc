@@ -10,9 +10,11 @@ const path = require("path");
 const fs   = require("fs");
 const net  = require("net");
 const crypto = require("crypto");
-const { spawn } = require("child_process");
 const { normalizeWorkspace } = require("./src/workspace");
 const { buildTorrc } = require("./src/tor-config");
+const { launchTorProcess } = require("./src/tor-process");
+const { ProfileRuntime } = require("./src/profile-runtime");
+const { ProfileRuntimeManager } = require("./src/profile-runtime-manager");
 
 app.commandLine.appendSwitch("force-webrtc-ip-handling-policy", "disable_non_proxied_udp");
 app.commandLine.appendSwitch("disable-background-timer-throttling");
@@ -99,41 +101,6 @@ function saveGroups() {
 function reserveGroupId() { return nextGroupId++; }
 function reserveAccountId() { return nextAccountId++; }
 
-async function removeAccountRuntime(accountId) {
-    stoppingAccountIds.add(accountId);
-    if (healthTimers.has(accountId)) {
-        clearInterval(healthTimers.get(accountId));
-        healthTimers.delete(accountId);
-    }
-
-    const restartOperation = restartOperations.get(accountId);
-    if (restartOperation) await restartOperation.catch(() => {});
-
-    const torProcess = accountProcesses.get(accountId);
-    if (torProcess) {
-        accountProcesses.delete(accountId);
-        try {
-            if (torProcess.exitCode === null && !torProcess.killed) torProcess.kill();
-        } catch (error) {
-            writeLog("warn", "Failed to stop Tor process", { accountId, error: error.message });
-        }
-    }
-
-    const ses = accountSessions.get(accountId);
-    if (ses) {
-        await ses.closeAllConnections().catch(error => {
-            writeLog("warn", "Failed to close profile connections", { accountId, error: error.message });
-        }).finally(() => {
-            accountSessions.delete(accountId);
-            accountHealth.delete(accountId);
-        });
-    } else {
-        accountSessions.delete(accountId);
-        accountHealth.delete(accountId);
-    }
-    stoppingAccountIds.delete(accountId);
-}
-
 function ensureTorFiles(account) {
     const instanceDir = path.dirname(account.torrcFile);
     const dataDir = path.join(instanceDir, "data");
@@ -150,117 +117,43 @@ function ensureTorFiles(account) {
 const accounts = getAccounts();
 accounts.forEach(ensureTorFiles);
 
-const accountProcesses = new Map();
-const accountSessions = new Map();
-const accountHealth = new Map();
-const healthTimers = new Map();
-const restartOperations = new Map();
-const stoppingAccountIds = new Set();
 let mainWin = null;
 let shutdownStarted = false;
 
-function setAccountHealth(accountId, patch = {}) {
-    const current = accountHealth.get(accountId) || {
-        accountId,
-        status: "starting",
-        message: "Aguardando bootstrap",
-        bootstrapped: false,
-        retries: 0,
-        lastUpdated: Date.now()
-    };
-
-    const next = {
-        ...current,
-        ...patch,
-        accountId,
-        lastUpdated: Date.now()
-    };
-
-    accountHealth.set(accountId, next);
-    const payload = { accountId, ...next };
-
+function publishRuntimeState(payload, previousState) {
+    const { accountId } = payload;
     if (mainWin && !mainWin.isDestroyed()) {
         mainWin.webContents.send("account-health-update", payload);
     }
-
-    writeAccountLog(accountId, next.status === "error" ? "error" : "info", next.message, {
-        status: next.status,
-        bootstrapped: next.bootstrapped,
-        retries: next.retries,
-        torPort: next.torPort,
-        controlPort: next.controlPort,
+    writeAccountLog(accountId, payload.status === "error" ? "error" : "info", payload.message, {
+        event: "runtime-state-transition",
+        state: payload.state,
+        previousState,
+        status: payload.status,
+        bootstrapped: payload.bootstrapped,
+        retries: payload.retries,
+        torPort: payload.torPort,
+        controlPort: payload.controlPort
     });
-
-    return next;
 }
 
-function getAccountHealth(accountId) {
-    return accountHealth.get(accountId) || {
-        accountId,
-        status: "unknown",
-        message: "Sem status disponível",
-        bootstrapped: false,
-        retries: 0,
-        lastUpdated: Date.now()
-    };
-}
-
-function registerHealthTimer(account) {
-    if (healthTimers.has(account.id)) {
-        clearInterval(healthTimers.get(account.id));
-    }
-
-    const timer = setInterval(async () => {
-        const proc = accountProcesses.get(account.id);
-        const status = getAccountHealth(account.id);
-        const running = !!proc && proc.exitCode === null;
-
-        if (!running) {
-            const currentState = getAccountHealth(account.id);
-            if (currentState.status !== "recovering") {
-                setAccountHealth(account.id, {
-                    status: "degraded",
-                    message: "Tor fora do ar. Tentando recuperar...",
-                    bootstrapped: false,
-                    retries: (currentState.retries || 0) + 1
-                });
-            }
-
-            try {
-                await restartAccountRuntime(account);
-            } catch (error) {
-                setAccountHealth(account.id, {
-                    status: "error",
-                    message: error.message || "Falha ao recuperar Tor",
-                    bootstrapped: false,
-                    retries: (getAccountHealth(account.id).retries || 0) + 1
-                });
-                writeLog("error", `Recovery failed for account ${account.id}`, { accountId: account.id, error: error.message });
-            }
-            return;
+const runtimeManager = new ProfileRuntimeManager(profile => new ProfileRuntime(profile, {
+    healthIntervalMs: HEALTH_CHECK_INTERVAL_MS,
+    launchTor: (currentProfile, hooks) => launchTorProcess(currentProfile, {
+        torExecutable: TOR_EXE,
+        ...hooks,
+        onOutput: text => process.stdout.write(`[Tor ${currentProfile.torPort}] ${text}`)
+    }),
+    createSession: createProfileSession,
+    checkControlPort: port => testTorControlPort(port).then(() => true).catch(() => false),
+    onBootstrap: (profileId, percent) => {
+        if (mainWin && !mainWin.isDestroyed()) {
+            mainWin.webContents.send("bootstrap-progress", { id: profileId, pct: percent });
         }
-
-        const canConnect = await testTorControlPort(account.controlPort).catch(() => false);
-        if (!canConnect) {
-            setAccountHealth(account.id, {
-                status: status.bootstrapped ? "degraded" : "starting",
-                message: status.bootstrapped ? "ControlPort indisponível" : "Aguardando bootstrap",
-                bootstrapped: !!status.bootstrapped
-            });
-            return;
-        }
-
-        if (status.bootstrapped) {
-            setAccountHealth(account.id, {
-                status: "ready",
-                message: "Tor saudável e pronto",
-                bootstrapped: true
-            });
-        }
-    }, HEALTH_CHECK_INTERVAL_MS);
-
-    healthTimers.set(account.id, timer);
-}
+    },
+    onStateChange: publishRuntimeState,
+    onCleanupError: error => writeLog("warn", "Runtime cleanup failed", { error: error.message })
+}));
 
 function testTorControlPort(port) {
     return new Promise((resolve, reject) => {
@@ -277,188 +170,11 @@ function testTorControlPort(port) {
     });
 }
 
-function restartAccountRuntime(account) {
-    if (stoppingAccountIds.has(account.id)) {
-        return Promise.reject(new Error("A conta está sendo encerrada"));
-    }
-    if (restartOperations.has(account.id)) return restartOperations.get(account.id);
-    const operation = performAccountRestart(account)
-        .finally(() => restartOperations.delete(account.id));
-    restartOperations.set(account.id, operation);
-    return operation;
-}
-
-async function performAccountRestart(account) {
-    const existing = accountProcesses.get(account.id);
-    if (existing && existing.exitCode === null) {
-        return existing;
-    }
-
-    setAccountHealth(account.id, {
-        status: "recovering",
-        message: "Reconectando Tor e sessão",
-        bootstrapped: false,
-        retries: (getAccountHealth(account.id).retries || 0) + 1
-    });
-
-    const existingSession = accountSessions.get(account.id);
-    if (existingSession) {
-        try {
-            await existingSession.closeAllConnections();
-        } catch (_) {}
-    }
-
-    const proc = await startTorInstance(account);
-    if (proc) {
-        await setupSession(account);
-        setAccountHealth(account.id, {
-            status: "ready",
-            message: "Tor recuperado com sucesso",
-            bootstrapped: true,
-            retries: Math.max(0, (getAccountHealth(account.id).retries || 0) - 1)
-        });
-        return proc;
-    }
-
-    throw new Error("Falha ao recuperar a instância Tor");
-}
-
-// ─────────────────────────────────────────────
-// Inicia uma instância Tor e emite progresso
-// ─────────────────────────────────────────────
-function startTorInstance(account) {
-    return new Promise((resolve, reject) => {
-        console.log(`[Tor ${account.torPort}] Iniciando...`);
-        writeLog("info", `Starting Tor instance for account ${account.id}`, {
-            accountId: account.id,
-            torPort: account.torPort,
-            controlPort: account.controlPort
-        });
-
-        const proc = spawn(TOR_EXE, ["-f", account.torrcFile], {
-            cwd: path.dirname(account.torrcFile),
-            stdio: ["ignore", "pipe", "pipe"]
-        });
-
-        accountProcesses.set(account.id, proc);
-        setAccountHealth(account.id, {
-            accountId: account.id,
-            torPort: account.torPort,
-            controlPort: account.controlPort,
-            status: "starting",
-            message: "Iniciando Tor",
-            bootstrapped: false,
-            retries: getAccountHealth(account.id).retries || 0
-        });
-
-        let bootstrapped = false;
-        let settled = false;
-        const failStartup = (error) => {
-            if (settled) return;
-            settled = true;
-            clearTimeout(timeout);
-            if (accountProcesses.get(account.id) === proc) accountProcesses.delete(account.id);
-            try {
-                if (proc.exitCode === null && !proc.killed) proc.kill();
-            } catch (killError) {
-                writeLog("warn", "Failed to kill unsuccessful Tor process", {
-                    accountId: account.id,
-                    error: killError.message
-                });
-            }
-            reject(error);
-        };
-        const timeout = setTimeout(() => {
-            if (!bootstrapped) {
-                const msg = `[Tor ${account.torPort}] Timeout ao aguardar bootstrap.`;
-                setAccountHealth(account.id, {
-                    status: "error",
-                    message: msg,
-                    bootstrapped: false
-                });
-                failStartup(new Error(msg));
-            }
-        }, 90000);
-
-        function onData(chunk) {
-            const line = chunk.toString();
-            process.stdout.write(`[Tor ${account.torPort}] ${line}`);
-
-            const matchPct = line.match(/Bootstrapped (\d+)%/);
-            if (matchPct) {
-                const pct = parseInt(matchPct[1], 10);
-                if (mainWin && !mainWin.isDestroyed()) {
-                    mainWin.webContents.send("bootstrap-progress", { id: account.id, pct });
-                }
-
-                if (pct === 100 && !bootstrapped) {
-                    bootstrapped = true;
-                    settled = true;
-                    clearTimeout(timeout);
-                    setAccountHealth(account.id, {
-                        status: "ready",
-                        message: "Tor pronto",
-                        bootstrapped: true
-                    });
-                    writeLog("info", `Tor instance ready`, { accountId: account.id, torPort: account.torPort });
-                    console.log(`[Tor ${account.torPort}] ✅ Pronto!`);
-                    resolve(proc);
-                }
-            }
-
-            if (line.includes("[err]") || line.includes("[warn] Could not bind")) {
-                clearTimeout(timeout);
-                const msg = `[Tor ${account.torPort}] Erro: ${line.trim()}`;
-                setAccountHealth(account.id, {
-                    status: "error",
-                    message: msg,
-                    bootstrapped: false
-                });
-                failStartup(new Error(msg));
-            }
-        }
-
-        proc.stdout.on("data", onData);
-        proc.stderr.on("data", onData);
-
-        proc.once("error", error => {
-            setAccountHealth(account.id, {
-                status: "error",
-                message: `Falha ao iniciar Tor: ${error.message}`,
-                bootstrapped: false
-            });
-            failStartup(error);
-        });
-
-        proc.on("exit", (code) => {
-            if (accountProcesses.get(account.id) === proc) accountProcesses.delete(account.id);
-            if (!bootstrapped) {
-                clearTimeout(timeout);
-                const msg = `[Tor ${account.torPort}] Processo encerrou antes do bootstrap (code=${code})`;
-                setAccountHealth(account.id, {
-                    status: "error",
-                    message: msg,
-                    bootstrapped: false
-                });
-                failStartup(new Error(msg));
-                return;
-            }
-
-            setAccountHealth(account.id, {
-                status: "degraded",
-                message: "Instância Tor encerrou após bootstrap",
-                bootstrapped: false
-            });
-            writeLog("warn", `Tor process exited after bootstrap`, { accountId: account.id, code, torPort: account.torPort });
-        });
-    });
-}
-
 // ─────────────────────────────────────────────
 // Configura a sessão Electron para cada conta
 // ─────────────────────────────────────────────
 
-async function setupSession(account) {
+async function createProfileSession(account) {
     const partition = `persist:account-${account.id}`;
     const ses = session.fromPartition(partition, { cache: true });
 
@@ -471,7 +187,6 @@ async function setupSession(account) {
     await ses.closeAllConnections();
 
     console.log(`[${account.name}] Sessão Chromium persistente configurada → SOCKS5 127.0.0.1:${account.torPort}`);
-    accountSessions.set(account.id, ses);
     return ses;
 }
 
@@ -509,7 +224,7 @@ function createMainWindow() {
 function wait(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
 async function verifyBrowserRoute(account) {
-    const ses = accountSessions.get(account.id);
+    const ses = runtimeManager.get(account.id)?.session;
     if (!ses) throw new Error("A sessão Chromium desta conta ainda não está pronta");
 
     let lastError;
@@ -542,8 +257,16 @@ async function verifyBrowserRoute(account) {
 async function checkForLeaks(accountId) {
     const account = getAccounts().find(a => a.id === Number(accountId));
     if (!account) throw new Error("Conta não encontrada");
-    const route = await verifyBrowserRoute(account);
+    const runtime = runtimeManager.get(account.id);
+    let route;
+    try {
+        route = await verifyBrowserRoute(account);
+    } catch (error) {
+        runtime?.reportRoute({ reachable: false });
+        throw error;
+    }
     const hasLeak = route.isTor !== true;
+    runtime?.reportRoute({ reachable: true, isTor: route.isTor });
     const message = hasLeak
         ? "A rota Chromium não foi reconhecida como conexão Tor"
         : "Rota Chromium confirmada pela rede Tor";
@@ -568,7 +291,15 @@ ipcMain.handle("get-account-info", () => {
 
 ipcMain.handle("get-account-health", (_, accountId) => {
     const resolvedId = Number(accountId);
-    return getAccountHealth(resolvedId);
+    return runtimeManager.get(resolvedId)?.snapshot() || {
+        accountId: resolvedId,
+        state: "STOPPED",
+        status: "unknown",
+        message: "Sem runtime ativo",
+        bootstrapped: false,
+        retries: 0,
+        lastUpdated: Date.now()
+    };
 });
 
 // ── Leak Detection IPC ──
@@ -607,19 +338,14 @@ ipcMain.handle("create-group", async (_, { name, accountCount }) => {
     newAccounts.forEach(ensureTorFiles);
     saveGroups();
 
-    await Promise.all(newAccounts.map(async account => {
-        await startTorInstance(account);
-        await setupSession(account);
-        setAccountHealth(account.id, {
-            accountId: account.id,
-            torPort: account.torPort,
-            controlPort: account.controlPort,
-            status: "ready",
-            message: "Sessão ativa e pronta",
-            bootstrapped: true
-        });
-        registerHealthTimer(account);
-    }));
+    try {
+        await Promise.all(newAccounts.map(account => runtimeManager.ensure(account).start()));
+    } catch (error) {
+        await Promise.allSettled(newAccounts.map(account => runtimeManager.destroy(account.id)));
+        groups = groups.filter(item => item.id !== groupId);
+        saveGroups();
+        throw error;
+    }
 
     if (mainWin && !mainWin.isDestroyed()) {
         mainWin.webContents.send("group-created", {
@@ -673,7 +399,7 @@ ipcMain.handle("delete-group", async (_, groupId) => {
     saveGroups();
 
     for (const accountId of accountIds) {
-        await removeAccountRuntime(accountId);
+        await runtimeManager.destroy(accountId);
     }
 
     if (mainWin && !mainWin.isDestroyed()) {
@@ -694,18 +420,9 @@ ipcMain.handle("add-account", async (_, groupId) => {
     saveGroups();
 
     try {
-        await startTorInstance(details);
-        await setupSession(details);
-        setAccountHealth(details.id, {
-            accountId: details.id,
-            torPort: details.torPort,
-            controlPort: details.controlPort,
-            status: "ready",
-            message: "Sessão ativa e pronta",
-            bootstrapped: true
-        });
-        registerHealthTimer(details);
+        await runtimeManager.ensure(details).start();
     } catch (error) {
+        await runtimeManager.destroy(details.id);
         group.accounts = group.accounts.filter(item => item.id !== accountId);
         saveGroups();
         throw error;
@@ -727,7 +444,7 @@ ipcMain.handle("remove-account", async (_, accountId) => {
     group.accounts = group.accounts.filter(item => item.id !== account.id);
     saveGroups();
 
-    await removeAccountRuntime(account.id);
+    await runtimeManager.destroy(account.id);
     if (mainWin && !mainWin.isDestroyed()) mainWin.webContents.send("account-removed", account.id);
     return true;
 });
@@ -840,37 +557,41 @@ async function authenticateSafeCookie(controller, account) {
 ipcMain.handle("tor-new-identity", async (_, accountId) => {
     const account = getAccounts().find(a => a.id === Number(accountId));
     if (!account) throw new Error("Conta não encontrada");
+    const runtime = runtimeManager.get(account.id);
+    if (!runtime) throw new Error("Runtime da conta não está ativo");
 
-    const previousRoute = await verifyBrowserRoute(account).catch(() => null);
-    const controller = await openTorController(account);
-    try {
-        await authenticateSafeCookie(controller, account);
-        await controller.command("SIGNAL NEWNYM");
-    } finally {
-        controller.close();
-    }
+    return runtime.runOperation(async () => {
+        const previousRoute = await verifyBrowserRoute(account).catch(() => null);
+        const controller = await openTorController(account);
+        try {
+            await authenticateSafeCookie(controller, account);
+            await controller.command("SIGNAL NEWNYM");
+        } finally {
+            controller.close();
+        }
 
-    const ses = accountSessions.get(account.id);
-    if (ses) await ses.closeAllConnections();
+        if (runtime.session) await runtime.session.closeAllConnections();
 
-    let route;
-    for (let attempt = 0; attempt < 3; attempt++) {
-        await wait(1500 * (attempt + 1));
-        route = await verifyBrowserRoute(account);
-        if (route.isTor) break;
-    }
-    if (!route?.isTor) throw new Error("O novo circuito não foi reconhecido como rota Tor");
+        let route;
+        for (let attempt = 0; attempt < 3; attempt++) {
+            await wait(1500 * (attempt + 1));
+            route = await verifyBrowserRoute(account);
+            if (route.isTor) break;
+        }
+        if (!route?.isTor) throw new Error("O novo circuito não foi reconhecido como rota Tor");
 
-    const changed = previousRoute?.ip ? previousRoute.ip !== route.ip : null;
-    const message = changed === false
-        ? "Novo circuito confirmado; o relay de saída manteve o mesmo IP"
-        : "Novo circuito e rota Chromium confirmados";
-    writeAccountLog(account.id, "info", message, {
-        previousIP: previousRoute?.ip || null,
-        newIP: route.ip,
-        changed
+        runtime.reportRoute({ reachable: true, isTor: true });
+        const changed = previousRoute?.ip ? previousRoute.ip !== route.ip : null;
+        const message = changed === false
+            ? "Novo circuito confirmado; o relay de saída manteve o mesmo IP"
+            : "Novo circuito e rota Chromium confirmados";
+        writeAccountLog(account.id, "info", message, {
+            previousIP: previousRoute?.ip || null,
+            newIP: route.ip,
+            changed
+        });
+        return { previousIP: previousRoute?.ip || null, newIP: route.ip, changed, verified: true, message };
     });
-    return { previousIP: previousRoute?.ip || null, newIP: route.ip, changed, verified: true, message };
 });
 
 // ─────────────────────────────────────────────
@@ -888,28 +609,17 @@ ipcMain.on("open-devtools", (event, accountId) => {
 // ─────────────────────────────────────────────
 // Encerramento limpo
 // ─────────────────────────────────────────────
-function killAllTor() {
+function stopAllRuntimes() {
     if (shutdownStarted) return;
     shutdownStarted = true;
-    console.log("\nEncerrando processos Tor...");
-    for (const timer of healthTimers.values()) {
-        clearInterval(timer);
-    }
-    healthTimers.clear();
-    for (const [accountId, proc] of accountProcesses) {
-        try {
-            if (proc.exitCode === null && !proc.killed) proc.kill();
-        } catch (error) {
-            writeLog("warn", "Failed to stop Tor during shutdown", { accountId, error: error.message });
-        }
-    }
-    accountProcesses.clear();
+    console.log("\nEncerrando runtimes de perfil...");
+    void runtimeManager.stopAll();
 }
 
-app.on("before-quit", killAllTor);
+app.on("before-quit", stopAllRuntimes);
 app.on("window-all-closed", () => {
     if (process.platform !== "darwin") {
-        killAllTor();
+        stopAllRuntimes();
         app.quit();
     }
 });
@@ -931,10 +641,10 @@ app.whenReady().then(async () => {
         mainWin.webContents.once("did-finish-load", resolve);
     });
 
-    // 3. Inicia todos os processos Tor em paralelo (renderer recebe progresso em tempo real)
-    console.log(`\n🧅 Iniciando ${accounts.length} instâncias Tor em paralelo...\n`);
+    // 3. Inicia um runtime autoritativo por perfil em paralelo.
+    console.log(`\n🧅 Iniciando ${accounts.length} runtimes de perfil em paralelo...\n`);
     try {
-        await Promise.all(accounts.map(startTorInstance));
+        await Promise.all(accounts.map(account => runtimeManager.ensure(account).start()));
     } catch (err) {
         console.error("\n❌ Falha ao iniciar Tor:", err.message);
         console.error("Verifique se o tor.exe existe em:", TOR_EXE);
@@ -945,38 +655,14 @@ app.whenReady().then(async () => {
         return;
     }
 
-    console.log("\n✅ Todos os processos Tor estão prontos!\n");
+    console.log("\n✅ Todos os runtimes estão prontos!\n");
 
-    // 4. Configura sessões Electron (proxy por conta)
-    console.log("🔧 Configurando sessões Electron...");
-    try {
-        for (const account of accounts) {
-            await setupSession(account);
-            setAccountHealth(account.id, {
-                accountId: account.id,
-                torPort: account.torPort,
-                controlPort: account.controlPort,
-                status: "ready",
-                message: "Sessão ativa e pronta",
-                bootstrapped: true
-            });
-            registerHealthTimer(account);
-        }
-    } catch (error) {
-        console.error("Falha ao configurar sessões Chromium:", error.message);
-        if (mainWin && !mainWin.isDestroyed()) {
-            mainWin.webContents.send("tor-boot-error", error.message);
-        }
-        app.quit();
-        return;
-    }
-
-    // 5. Sinaliza ao renderer que o boot terminou
+    // 4. Sinaliza ao renderer que o boot terminou
     if (mainWin && !mainWin.isDestroyed()) {
         mainWin.webContents.send("tor-boot-complete");
     }
 
-    // 6. Verifica IPs no console (log lateral)
+    // 5. Verifica IPs no console (log lateral)
     console.log(`\n🔍 Verificando IPs de ${accounts.length} sessões...\n`);
     for (const account of accounts) {
         try {
