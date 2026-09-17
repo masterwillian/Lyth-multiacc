@@ -76,6 +76,7 @@ function reorderOverview(sourceId, targetId) {
 }
 
 let appBootCompleted = false;
+let routeRefreshTimer = null;
 
 function reloadAllAccounts() {
     if (!appBootCompleted) return;
@@ -189,7 +190,8 @@ mc.onBootComplete(() => {
     accounts.forEach(account => refreshAccountIP(account));
     // A rota pública da conta é checada em um intervalo fixo, sem depender do
     // site atualmente aberto dentro da webview.
-    setInterval(() => {
+    if (routeRefreshTimer) clearInterval(routeRefreshTimer);
+    routeRefreshTimer = setInterval(() => {
         accounts.forEach(account => refreshAccountIP(account));
     }, 60_000);
     
@@ -263,6 +265,23 @@ const webviews = {};
 const ipBadges = {};
 const routeChecksInFlight = new Set();
 const lastRouteCheckAt = new Map();
+const accountCleanups = new Map();
+
+function cleanupAccountPanel(accountId) {
+    const cleanup = accountCleanups.get(Number(accountId));
+    if (cleanup) cleanup();
+    accountCleanups.delete(Number(accountId));
+    delete webviews[accountId];
+    delete ipBadges[accountId];
+    routeChecksInFlight.delete(Number(accountId));
+    lastRouteCheckAt.delete(Number(accountId));
+}
+
+window.addEventListener("beforeunload", () => {
+    if (routeRefreshTimer) clearInterval(routeRefreshTimer);
+    for (const cleanup of accountCleanups.values()) cleanup();
+    accountCleanups.clear();
+});
 
 function showIPBadge(account, ip, message) {
     const ipBadge = ipBadges[account.id];
@@ -519,7 +538,6 @@ function createAccountPanel(account) {
     // ── Webview com partition isolada (sem carregar URL de imediato) ──
     const wv = document.createElement("webview");
     wv.setAttribute("partition", account.partition);
-    wv.setAttribute("allowpopups", "");
     wv.setAttribute("src", "about:blank");
     webviews[account.id] = wv;
     wv.dataset.initialUrl = urlInput.value;
@@ -708,6 +726,13 @@ function createAccountPanel(account) {
     };
 
     document.addEventListener('keydown', handleKeydown);
+    accountCleanups.set(account.id, () => {
+        document.removeEventListener('keydown', handleKeydown);
+        if (typeof wv.stop === "function") {
+            try { wv.stop(); } catch (_) {}
+        }
+        wv.remove();
+    });
 }
 
 // Cria painéis, mas não carrega URLs de imediato
@@ -818,10 +843,10 @@ function deleteGroup(groupId) {
             groups.splice(index, 1);
             accountIds.forEach(accountId => {
                 const cell = document.querySelector(`.cell[data-account-id="${accountId}"]`);
+                cleanupAccountPanel(accountId);
                 if (cell) cell.remove();
                 const accountIndex = accounts.findIndex(item => item.id === accountId);
                 if (accountIndex >= 0) accounts.splice(accountIndex, 1);
-                delete webviews[accountId];
             });
         }
         closeGroupContextMenu();
@@ -1013,6 +1038,7 @@ mc.onAccountAdded(account => {
 mc.onAccountRemoved(accountId => {
     const cell = document.querySelector(`.cell[data-account-id="${accountId}"]`);
     const account = accounts.find(item => item.id === accountId);
+    cleanupAccountPanel(accountId);
     if (cell) cell.remove();
     if (account) {
         const group = groups.find(item => item.id === account.batchId);
@@ -1022,8 +1048,6 @@ mc.onAccountRemoved(accountId => {
     const accountIndex = accounts.findIndex(item => item.id === accountId);
     if (accountIndex >= 0) accounts.splice(accountIndex, 1);
     syncOverviewOrder();
-    delete webviews[accountId];
-    delete ipBadges[accountId];
     updateOverviewGridLayout();
     applyVisibleAccounts();
 });

@@ -11,6 +11,8 @@ const fs   = require("fs");
 const net  = require("net");
 const crypto = require("crypto");
 const { spawn } = require("child_process");
+const { normalizeWorkspace } = require("./src/workspace");
+const { buildTorrc } = require("./src/tor-config");
 
 app.commandLine.appendSwitch("force-webrtc-ip-handling-policy", "disable_non_proxied_udp");
 app.commandLine.appendSwitch("disable-background-timer-throttling");
@@ -23,19 +25,10 @@ const TOR_DIR = path.join(__dirname, "..", "tor");
 const GROUPS_FILE = path.join(__dirname, "groups.json");
 const LOGS_DIR = path.join(__dirname, "logs");
 const HEALTH_CHECK_INTERVAL_MS = 15000;
+const MAX_LOG_BYTES = 5 * 1024 * 1024;
 
 function loadWorkspace() {
-    const stored = JSON.parse(fs.readFileSync(GROUPS_FILE, "utf8"));
-    const loadedGroups = Array.isArray(stored.groups) ? stored.groups : [];
-    const maxGroupId = loadedGroups.reduce((max, group) => Math.max(max, Number(group.id) || 0), 0);
-    const maxAccountId = loadedGroups.flatMap(group => group.accounts || [])
-        .reduce((max, account) => Math.max(max, Number(account.id) || 0), 0);
-    return {
-        groups: loadedGroups,
-        // Older files do not have counters. Once written, IDs are never reused.
-        nextGroupId: Math.max(Number(stored.nextGroupId) || 0, maxGroupId + 1),
-        nextAccountId: Math.max(Number(stored.nextAccountId) || 0, maxAccountId + 1)
-    };
+    return normalizeWorkspace(JSON.parse(fs.readFileSync(GROUPS_FILE, "utf8")));
 }
 
 const workspace = loadWorkspace();
@@ -47,6 +40,19 @@ function ensureLogsDir() {
     fs.mkdirSync(LOGS_DIR, { recursive: true });
 }
 
+function appendBoundedLog(file, line) {
+    try {
+        if (fs.existsSync(file) && fs.statSync(file).size + Buffer.byteLength(line) > MAX_LOG_BYTES) {
+            const previous = `${file}.1`;
+            if (fs.existsSync(previous)) fs.unlinkSync(previous);
+            fs.renameSync(file, previous);
+        }
+        fs.appendFileSync(file, line, "utf8");
+    } catch (error) {
+        console.error(`Falha ao gravar log ${file}:`, error.message);
+    }
+}
+
 function writeLog(level, message, meta = {}) {
     ensureLogsDir();
     const line = JSON.stringify({
@@ -55,7 +61,7 @@ function writeLog(level, message, meta = {}) {
         message,
         ...meta
     }) + "\n";
-    fs.appendFileSync(path.join(LOGS_DIR, "app.log"), line, "utf8");
+    appendBoundedLog(path.join(LOGS_DIR, "app.log"), line);
 }
 
 function writeAccountLog(accountId, level, message, meta = {}) {
@@ -67,7 +73,7 @@ function writeAccountLog(accountId, level, message, meta = {}) {
         accountId,
         ...meta
     }) + "\n";
-    fs.appendFileSync(path.join(LOGS_DIR, `account-${accountId}.log`), line, "utf8");
+    appendBoundedLog(path.join(LOGS_DIR, `account-${accountId}.log`), line);
 }
 
 function accountDetails(account, group) {
@@ -93,29 +99,39 @@ function saveGroups() {
 function reserveGroupId() { return nextGroupId++; }
 function reserveAccountId() { return nextAccountId++; }
 
-function removeAccountRuntime(accountId) {
-    const process = accountProcesses.get(accountId);
-    if (process) {
-        try { process.kill(); } catch (_) {}
-        accountProcesses.delete(accountId);
-    }
-
+async function removeAccountRuntime(accountId) {
+    stoppingAccountIds.add(accountId);
     if (healthTimers.has(accountId)) {
         clearInterval(healthTimers.get(accountId));
         healthTimers.delete(accountId);
     }
 
+    const restartOperation = restartOperations.get(accountId);
+    if (restartOperation) await restartOperation.catch(() => {});
+
+    const torProcess = accountProcesses.get(accountId);
+    if (torProcess) {
+        accountProcesses.delete(accountId);
+        try {
+            if (torProcess.exitCode === null && !torProcess.killed) torProcess.kill();
+        } catch (error) {
+            writeLog("warn", "Failed to stop Tor process", { accountId, error: error.message });
+        }
+    }
+
     const ses = accountSessions.get(accountId);
     if (ses) {
-        return ses.closeAllConnections().finally(() => {
+        await ses.closeAllConnections().catch(error => {
+            writeLog("warn", "Failed to close profile connections", { accountId, error: error.message });
+        }).finally(() => {
             accountSessions.delete(accountId);
             accountHealth.delete(accountId);
         });
+    } else {
+        accountSessions.delete(accountId);
+        accountHealth.delete(accountId);
     }
-
-    accountSessions.delete(accountId);
-    accountHealth.delete(accountId);
-    return Promise.resolve();
+    stoppingAccountIds.delete(accountId);
 }
 
 function ensureTorFiles(account) {
@@ -123,43 +139,25 @@ function ensureTorFiles(account) {
     const dataDir = path.join(instanceDir, "data");
     fs.mkdirSync(dataDir, { recursive: true });
 
-    const geoipBaseDir = path.dirname(TOR_EXE);
-    const geoipFiles = [
-        { key: "GeoIPFile", file: path.join(geoipBaseDir, "geoip") },
-        { key: "GeoIPv6File", file: path.join(geoipBaseDir, "geoip6") }
-    ].filter(item => fs.existsSync(item.file));
-
-    const torrcLines = [
-        `SocksPort 127.0.0.1:${account.torPort} IsolateClientAddr IsolateSOCKSAuth`,
-        `DataDirectory ${dataDir}`,
-        "",
-        "Log notice stdout",
-        "",
-        "MaxCircuitDirtiness 60",
-        "NewCircuitPeriod 30",
-        "",
-        "TestSocks 1",
-        "SafeSocks 1",
-        "",
-        ...geoipFiles.map(item => `${item.key} ${item.file}`),
-        "",
-        `ControlPort 127.0.0.1:${account.controlPort}`,
-        "CookieAuthentication 1",
-        ""
-    ];
-
-    fs.writeFileSync(account.torrcFile, torrcLines.join("\n"));
+    fs.writeFileSync(account.torrcFile, buildTorrc({
+        torPort: account.torPort,
+        controlPort: account.controlPort,
+        dataDir,
+        torExecutable: TOR_EXE
+    }));
 }
 
 const accounts = getAccounts();
 accounts.forEach(ensureTorFiles);
 
-const torProcesses = [];
 const accountProcesses = new Map();
 const accountSessions = new Map();
 const accountHealth = new Map();
 const healthTimers = new Map();
+const restartOperations = new Map();
+const stoppingAccountIds = new Set();
 let mainWin = null;
+let shutdownStarted = false;
 
 function setAccountHealth(accountId, patch = {}) {
     const current = accountHealth.get(accountId) || {
@@ -279,7 +277,18 @@ function testTorControlPort(port) {
     });
 }
 
-async function restartAccountRuntime(account) {
+function restartAccountRuntime(account) {
+    if (stoppingAccountIds.has(account.id)) {
+        return Promise.reject(new Error("A conta está sendo encerrada"));
+    }
+    if (restartOperations.has(account.id)) return restartOperations.get(account.id);
+    const operation = performAccountRestart(account)
+        .finally(() => restartOperations.delete(account.id));
+    restartOperations.set(account.id, operation);
+    return operation;
+}
+
+async function performAccountRestart(account) {
     const existing = accountProcesses.get(account.id);
     if (existing && existing.exitCode === null) {
         return existing;
@@ -331,7 +340,6 @@ function startTorInstance(account) {
             stdio: ["ignore", "pipe", "pipe"]
         });
 
-        torProcesses.push(proc);
         accountProcesses.set(account.id, proc);
         setAccountHealth(account.id, {
             accountId: account.id,
@@ -344,6 +352,22 @@ function startTorInstance(account) {
         });
 
         let bootstrapped = false;
+        let settled = false;
+        const failStartup = (error) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timeout);
+            if (accountProcesses.get(account.id) === proc) accountProcesses.delete(account.id);
+            try {
+                if (proc.exitCode === null && !proc.killed) proc.kill();
+            } catch (killError) {
+                writeLog("warn", "Failed to kill unsuccessful Tor process", {
+                    accountId: account.id,
+                    error: killError.message
+                });
+            }
+            reject(error);
+        };
         const timeout = setTimeout(() => {
             if (!bootstrapped) {
                 const msg = `[Tor ${account.torPort}] Timeout ao aguardar bootstrap.`;
@@ -352,7 +376,7 @@ function startTorInstance(account) {
                     message: msg,
                     bootstrapped: false
                 });
-                reject(new Error(msg));
+                failStartup(new Error(msg));
             }
         }, 90000);
 
@@ -369,6 +393,7 @@ function startTorInstance(account) {
 
                 if (pct === 100 && !bootstrapped) {
                     bootstrapped = true;
+                    settled = true;
                     clearTimeout(timeout);
                     setAccountHealth(account.id, {
                         status: "ready",
@@ -389,14 +414,24 @@ function startTorInstance(account) {
                     message: msg,
                     bootstrapped: false
                 });
-                reject(new Error(msg));
+                failStartup(new Error(msg));
             }
         }
 
         proc.stdout.on("data", onData);
         proc.stderr.on("data", onData);
 
+        proc.once("error", error => {
+            setAccountHealth(account.id, {
+                status: "error",
+                message: `Falha ao iniciar Tor: ${error.message}`,
+                bootstrapped: false
+            });
+            failStartup(error);
+        });
+
         proc.on("exit", (code) => {
+            if (accountProcesses.get(account.id) === proc) accountProcesses.delete(account.id);
             if (!bootstrapped) {
                 clearTimeout(timeout);
                 const msg = `[Tor ${account.torPort}] Processo encerrou antes do bootstrap (code=${code})`;
@@ -405,7 +440,7 @@ function startTorInstance(account) {
                     message: msg,
                     bootstrapped: false
                 });
-                reject(new Error(msg));
+                failStartup(new Error(msg));
                 return;
             }
 
@@ -423,95 +458,6 @@ function startTorInstance(account) {
 // Configura a sessão Electron para cada conta
 // ─────────────────────────────────────────────
 
-// User-Agents variados (desktop + mobile + browsers)
-const userAgents = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edge/120.0.0.0",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1",
-    "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15"
-];
-
-function getRandomUserAgent() {
-    return userAgents[Math.floor(Math.random() * userAgents.length)];
-}
-
-// Canvas Fingerprinting Protection Script
-const canvasProtectionScript = `
-(function() {
-    // Protege Canvas.toDataURL
-    const originalToDataURL = HTMLCanvasElement.prototype.toDataURL;
-    HTMLCanvasElement.prototype.toDataURL = function(type) {
-        if (this.width === 0 || this.height === 0) {
-            return originalToDataURL.call(this, type);
-        }
-        const ctx = this.getContext('2d');
-        if (ctx) {
-            ctx.fillStyle = 'rgba(' + Math.floor(Math.random()*256) + ',' + Math.floor(Math.random()*256) + ',' + Math.floor(Math.random()*256) + ',0.5)';
-            ctx.fillRect(0, 0, 1, 1);
-        }
-        return originalToDataURL.call(this, type);
-    };
-    
-    // Protege Canvas.toBlob
-    const originalToBlob = HTMLCanvasElement.prototype.toBlob;
-    HTMLCanvasElement.prototype.toBlob = function(callback, type, quality) {
-        const ctx = this.getContext('2d');
-        if (ctx && this.width > 0 && this.height > 0) {
-            ctx.fillStyle = 'rgba(' + Math.floor(Math.random()*256) + ',' + Math.floor(Math.random()*256) + ',' + Math.floor(Math.random()*256) + ',0.5)';
-            ctx.fillRect(0, 0, 1, 1);
-        }
-        return originalToBlob.call(this, callback, type, quality);
-    };
-    
-    // Protege WebGL Fingerprinting
-    const getParameter = WebGLRenderingContext.prototype.getParameter;
-    WebGLRenderingContext.prototype.getParameter = function(parameter) {
-        if (parameter === 37445) {
-            return 'Intel Inc.';
-        }
-        if (parameter === 37446) {
-            return 'Intel Iris OpenGL Engine';
-        }
-        return getParameter.call(this, parameter);
-    };
-    
-    // Protege WebGL2 Fingerprinting
-    if (WebGL2RenderingContext) {
-        const getParameter2 = WebGL2RenderingContext.prototype.getParameter;
-        WebGL2RenderingContext.prototype.getParameter = function(parameter) {
-            if (parameter === 37445) {
-                return 'Intel Inc.';
-            }
-            if (parameter === 37446) {
-                return 'Intel Iris OpenGL Engine';
-            }
-            return getParameter2.call(this, parameter);
-        };
-    }
-    
-    // Bloqueia AudioContext fingerprinting
-    const AudioContext = window.AudioContext || window.webkitAudioContext;
-    if (AudioContext) {
-        const originalCreateAnalyser = AudioContext.prototype.createAnalyser;
-        AudioContext.prototype.createAnalyser = function() {
-            const analyser = originalCreateAnalyser.call(this);
-            const originalGetByteFrequencyData = analyser.getByteFrequencyData;
-            analyser.getByteFrequencyData = function(array) {
-                for (let i = 0; i < array.length; i++) {
-                    array[i] = Math.floor(Math.random() * 256);
-                }
-                return originalGetByteFrequencyData.call(this, array);
-            };
-            return analyser;
-        };
-    }
-})();
-`;
-
 async function setupSession(account) {
     const partition = `persist:account-${account.id}`;
     const ses = session.fromPartition(partition, { cache: true });
@@ -524,116 +470,7 @@ async function setupSession(account) {
 
     await ses.closeAllConnections();
 
-    // ── User-Agent Randomizer ──
-    const randomUA = getRandomUserAgent();
-    ses.setUserAgent(randomUA);
-
-    // ── DNS over HTTPS (DoH) via Custom Headers ──
-    ses.webRequest.onBeforeSendHeaders({ urls: ["<all_urls>"] }, (details, callback) => {
-        const headers = details.requestHeaders;
-        headers['DoH-User-Agent'] = 'tor-multiclient/1.0';
-        callback({ requestHeaders: headers });
-    });
-
-    // ── Adblock: Bloqueia requisições de ad networks conhecidas ──
-    const adDomains = new Set([
-        // Google & Doubleclick
-        "doubleclick.net", "googlesyndication.com", "googleadservices.com", "google-analytics.com",
-        // Facebook & Meta
-        "facebook.com", "facebook.net",
-        // Amazon
-        "amazon-adsystem.com",
-        // Taboola & Outbrain
-        "taboola.com", "outbrain.com",
-        // Criteo
-        "criteo.com",
-        // AppNexus
-        "appnexus.com", "adnxs.com",
-        // OpenX
-        "openx.net",
-        // Pubmatic
-        "pubmatic.com",
-        // Rubicon
-        "rubiconproject.com",
-        // Chartbeat
-        "chartbeat.net",
-        // Disqus
-        "disqus.com",
-        // Exponential Interactive
-        "exponential.com",
-        // Flurry
-        "flurry.com",
-        // Media.net
-        "media.net",
-        // Mixpanel
-        "mixpanel.com",
-        // Quantcast
-        "quantcast.com",
-        // Scorecard Research
-        "scorecardresearch.com",
-        // Segment
-        "segment.com",
-        // Sharethis
-        "sharethis.com",
-        // Site Meter
-        "sitemeter.com",
-        // Spotxchange
-        "spotxchange.com",
-        // Underdog Media
-        "underdogmedia.com",
-        // Vimeo
-        "vimeo.com",
-        // Yahoo
-        "yimg.com", "yahoo.com",
-        // Ad services
-        "ads.google.com", "ads.twitter.com", "ads.linkedin.com",
-        "ads-api.twitter.com", "linkedin.com/ads",
-        // Ad exchanges
-        "adroll.com", "polymorph.com", "turn.com",
-        // Tracking & Analytics
-        "hotjar.com", "mouseflow.com", "fullstory.com",
-        "amplitude.com", "branch.io", "firebase.google.com"
-    ]);
-
-    // Bloqueia requisições para ad networks
-    ses.webRequest.onBeforeRequest({ urls: ["<all_urls>"] }, (details, callback) => {
-        const url = new URL(details.url);
-        const hostname = url.hostname;
-        
-        // Verifica se o domínio está na lista de ads
-        const isAd = Array.from(adDomains).some(adDomain => 
-            hostname === adDomain || hostname.endsWith("." + adDomain)
-        );
-
-        if (isAd) {
-            callback({ cancel: true });
-        } else {
-            callback({ cancel: false });
-        }
-    });
-
-    // ── Canvas Fingerprinting Protection (injetado em cada página) ──
-    ses.setPreloads([
-        // Nota: Usamos webContents em vez de preload para evitar sandbox issues
-    ]);
-
-    // ── Cookie Isolation & Auto-Cleanup ──
-    // Limpa cookies a cada 30 minutos
-    const cookieCleanupInterval = setInterval(async () => {
-        try {
-            await ses.clearStorageData({
-                dataTypes: ['cookies']
-            });
-            console.log(`[${account.name}] Cookies limpos automaticamente`);
-        } catch (e) {
-            console.error(`[${account.name}] Erro ao limpar cookies:`, e.message);
-        }
-    }, 30 * 60 * 1000); // 30 minutos
-
-    // Guarda o interval para cleanup quando a sessão for destruída
-    ses.__cookieCleanupInterval = cookieCleanupInterval;
-
-    console.log(`[${account.name}] Sessão configurada → SOCKS5 127.0.0.1:${account.torPort} + DoH + UA Random + Canvas Protect + Adblock + CookieClean`);
+    console.log(`[${account.name}] Sessão Chromium persistente configurada → SOCKS5 127.0.0.1:${account.torPort}`);
     accountSessions.set(account.id, ses);
     return ses;
 }
@@ -747,6 +584,8 @@ ipcMain.handle("get-workspace", () => ({
         partition: `persist:account-${a.id}`
     }))
 }));
+
+ipcMain.handle("get-app-version", () => app.getVersion());
 
 ipcMain.handle("create-group", async (_, { name, accountCount }) => {
     const count = Number(accountCount);
@@ -1050,15 +889,21 @@ ipcMain.on("open-devtools", (event, accountId) => {
 // Encerramento limpo
 // ─────────────────────────────────────────────
 function killAllTor() {
+    if (shutdownStarted) return;
+    shutdownStarted = true;
     console.log("\nEncerrando processos Tor...");
     for (const timer of healthTimers.values()) {
         clearInterval(timer);
     }
     healthTimers.clear();
-    for (const proc of torProcesses) {
-        try { proc.kill(); } catch (_) {}
+    for (const [accountId, proc] of accountProcesses) {
+        try {
+            if (proc.exitCode === null && !proc.killed) proc.kill();
+        } catch (error) {
+            writeLog("warn", "Failed to stop Tor during shutdown", { accountId, error: error.message });
+        }
     }
-    torProcesses.length = 0;
+    accountProcesses.clear();
 }
 
 app.on("before-quit", killAllTor);
@@ -1104,17 +949,26 @@ app.whenReady().then(async () => {
 
     // 4. Configura sessões Electron (proxy por conta)
     console.log("🔧 Configurando sessões Electron...");
-    for (const account of accounts) {
-        await setupSession(account);
-        setAccountHealth(account.id, {
-            accountId: account.id,
-            torPort: account.torPort,
-            controlPort: account.controlPort,
-            status: "ready",
-            message: "Sessão ativa e pronta",
-            bootstrapped: true
-        });
-        registerHealthTimer(account);
+    try {
+        for (const account of accounts) {
+            await setupSession(account);
+            setAccountHealth(account.id, {
+                accountId: account.id,
+                torPort: account.torPort,
+                controlPort: account.controlPort,
+                status: "ready",
+                message: "Sessão ativa e pronta",
+                bootstrapped: true
+            });
+            registerHealthTimer(account);
+        }
+    } catch (error) {
+        console.error("Falha ao configurar sessões Chromium:", error.message);
+        if (mainWin && !mainWin.isDestroyed()) {
+            mainWin.webContents.send("tor-boot-error", error.message);
+        }
+        app.quit();
+        return;
     }
 
     // 5. Sinaliza ao renderer que o boot terminou
@@ -1123,7 +977,7 @@ app.whenReady().then(async () => {
     }
 
     // 6. Verifica IPs no console (log lateral)
-    console.log("\n🔍 Verificando IPs das 4 sessões...\n");
+    console.log(`\n🔍 Verificando IPs de ${accounts.length} sessões...\n`);
     for (const account of accounts) {
         try {
             const ip = await checkIPviaSocks(account.torPort);

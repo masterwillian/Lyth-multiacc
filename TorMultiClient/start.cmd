@@ -12,7 +12,7 @@ if errorlevel 1 (
 
 if not exist "%~dp0node_modules" (
     echo Dependencias nao encontradas. Instalando...
-    call npm install
+    call npm ci
     if errorlevel 1 (
         echo Falha ao instalar as dependencias.
         pause
