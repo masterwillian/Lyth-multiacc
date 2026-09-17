@@ -14,12 +14,12 @@ const RuntimeState = Object.freeze({
 
 const allowedTransitions = new Map([
     [RuntimeState.STOPPED, new Set([RuntimeState.STARTING])],
-    [RuntimeState.STARTING, new Set([RuntimeState.BOOTSTRAPPING, RuntimeState.TOR_FAILED, RuntimeState.ERROR, RuntimeState.STOPPED])],
-    [RuntimeState.BOOTSTRAPPING, new Set([RuntimeState.READY, RuntimeState.TOR_FAILED, RuntimeState.PROXY_FAILED, RuntimeState.ERROR, RuntimeState.STOPPED])],
+    [RuntimeState.STARTING, new Set([RuntimeState.BOOTSTRAPPING, RuntimeState.TOR_FAILED, RuntimeState.PROXY_FAILED, RuntimeState.ERROR, RuntimeState.STOPPED])],
+    [RuntimeState.BOOTSTRAPPING, new Set([RuntimeState.READY, RuntimeState.DEGRADED, RuntimeState.TOR_FAILED, RuntimeState.PROXY_FAILED, RuntimeState.ROUTE_FAILED, RuntimeState.LEAK_DETECTED, RuntimeState.ERROR, RuntimeState.STOPPED])],
     [RuntimeState.READY, new Set([RuntimeState.DEGRADED, RuntimeState.ROUTE_FAILED, RuntimeState.LEAK_DETECTED, RuntimeState.RECOVERING, RuntimeState.STOPPED, RuntimeState.ERROR])],
     [RuntimeState.DEGRADED, new Set([RuntimeState.READY, RuntimeState.RECOVERING, RuntimeState.TOR_FAILED, RuntimeState.STOPPED, RuntimeState.ERROR])],
-    [RuntimeState.TOR_FAILED, new Set([RuntimeState.RECOVERING, RuntimeState.STARTING, RuntimeState.STOPPED])],
-    [RuntimeState.PROXY_FAILED, new Set([RuntimeState.RECOVERING, RuntimeState.STARTING, RuntimeState.STOPPED])],
+    [RuntimeState.TOR_FAILED, new Set([RuntimeState.RECOVERING, RuntimeState.STARTING, RuntimeState.STOPPED, RuntimeState.ERROR])],
+    [RuntimeState.PROXY_FAILED, new Set([RuntimeState.RECOVERING, RuntimeState.STARTING, RuntimeState.STOPPED, RuntimeState.ERROR])],
     [RuntimeState.ROUTE_FAILED, new Set([RuntimeState.READY, RuntimeState.RECOVERING, RuntimeState.STOPPED])],
     [RuntimeState.LEAK_DETECTED, new Set([RuntimeState.READY, RuntimeState.RECOVERING, RuntimeState.STOPPED])],
     [RuntimeState.RECOVERING, new Set([RuntimeState.BOOTSTRAPPING, RuntimeState.READY, RuntimeState.TOR_FAILED, RuntimeState.PROXY_FAILED, RuntimeState.ERROR, RuntimeState.STOPPED])],

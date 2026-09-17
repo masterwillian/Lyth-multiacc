@@ -15,6 +15,8 @@ const { buildTorrc } = require("./src/tor-config");
 const { launchTorProcess } = require("./src/tor-process");
 const { ProfileRuntime } = require("./src/profile-runtime");
 const { ProfileRuntimeManager } = require("./src/profile-runtime-manager");
+const { rotateIdentity } = require("./src/newnym");
+const { configureFailClosedSession, inspectSessionProxy } = require("./src/session-routing");
 
 app.commandLine.appendSwitch("force-webrtc-ip-handling-policy", "disable_non_proxied_udp");
 app.commandLine.appendSwitch("disable-background-timer-throttling");
@@ -27,6 +29,9 @@ const TOR_DIR = path.join(__dirname, "..", "tor");
 const GROUPS_FILE = path.join(__dirname, "groups.json");
 const LOGS_DIR = path.join(__dirname, "logs");
 const HEALTH_CHECK_INTERVAL_MS = 15000;
+const EXTERNAL_HEALTH_INTERVAL_MS = 5 * 60 * 1000;
+const RESTART_BACKOFF_BASE_MS = 5000;
+const RESTART_BACKOFF_MAX_MS = 5 * 60 * 1000;
 const MAX_LOG_BYTES = 5 * 1024 * 1024;
 
 function loadWorkspace() {
@@ -118,34 +123,43 @@ const accounts = getAccounts();
 accounts.forEach(ensureTorFiles);
 
 let mainWin = null;
-let shutdownStarted = false;
 
-function publishRuntimeState(payload, previousState) {
+function publishRuntimeState(payload, previousState, event = "runtime-state-transition") {
     const { accountId } = payload;
     if (mainWin && !mainWin.isDestroyed()) {
         mainWin.webContents.send("account-health-update", payload);
     }
-    writeAccountLog(accountId, payload.status === "error" ? "error" : "info", payload.message, {
-        event: "runtime-state-transition",
-        state: payload.state,
-        previousState,
-        status: payload.status,
-        bootstrapped: payload.bootstrapped,
-        retries: payload.retries,
-        torPort: payload.torPort,
-        controlPort: payload.controlPort
-    });
+    if (event === "runtime-state-transition") {
+        writeAccountLog(accountId, payload.status === "error" ? "error" : "info", payload.message, {
+            event,
+            state: payload.state,
+            previousState,
+            status: payload.status,
+            bootstrapped: payload.bootstrapped,
+            retries: payload.retries,
+            torPort: payload.torPort,
+            controlPort: payload.controlPort
+        });
+    }
 }
 
 const runtimeManager = new ProfileRuntimeManager(profile => new ProfileRuntime(profile, {
     healthIntervalMs: HEALTH_CHECK_INTERVAL_MS,
+    externalHealthIntervalMs: EXTERNAL_HEALTH_INTERVAL_MS,
+    restartBackoffBaseMs: RESTART_BACKOFF_BASE_MS,
+    restartBackoffMaxMs: RESTART_BACKOFF_MAX_MS,
+    setIntervalFn: setInterval,
+    clearIntervalFn: clearInterval,
     launchTor: (currentProfile, hooks) => launchTorProcess(currentProfile, {
         torExecutable: TOR_EXE,
         ...hooks,
         onOutput: text => process.stdout.write(`[Tor ${currentProfile.torPort}] ${text}`)
     }),
     createSession: createProfileSession,
-    checkControlPort: port => testTorControlPort(port).then(() => true).catch(() => false),
+    inspectSessionProxy,
+    verifyExternalRoute: fetchExternalRoute,
+    checkControlPort: port => testTcpPort(port),
+    checkSocksPort: port => testTcpPort(port),
     onBootstrap: (profileId, percent) => {
         if (mainWin && !mainWin.isDestroyed()) {
             mainWin.webContents.send("bootstrap-progress", { id: profileId, pct: percent });
@@ -155,17 +169,26 @@ const runtimeManager = new ProfileRuntimeManager(profile => new ProfileRuntime(p
     onCleanupError: error => writeLog("warn", "Runtime cleanup failed", { error: error.message })
 }));
 
-function testTorControlPort(port) {
-    return new Promise((resolve, reject) => {
+function testTcpPort(port) {
+    return new Promise(resolve => {
+        let settled = false;
         const socket = net.createConnection({ host: "127.0.0.1", port }, () => {
-            socket.end();
+            if (settled) return;
+            settled = true;
+            socket.destroy();
             resolve(true);
         });
-
-        socket.on("error", reject);
-        socket.setTimeout(3000, () => {
+        socket.once("error", error => {
+            if (settled) return;
+            settled = true;
             socket.destroy();
-            reject(new Error("Timeout ao conectar no ControlPort"));
+            resolve(false);
+        });
+        socket.setTimeout(3000, () => {
+            if (settled) return;
+            settled = true;
+            socket.destroy();
+            resolve(false);
         });
     });
 }
@@ -178,13 +201,7 @@ async function createProfileSession(account) {
     const partition = `persist:account-${account.id}`;
     const ses = session.fromPartition(partition, { cache: true });
 
-    await ses.setProxy({
-        mode: "fixed_servers",
-        proxyRules: `socks5://127.0.0.1:${account.torPort}`,
-        proxyBypassRules: "<-loopback>"
-    });
-
-    await ses.closeAllConnections();
+    await configureFailClosedSession(ses, account);
 
     console.log(`[${account.name}] Sessão Chromium persistente configurada → SOCKS5 127.0.0.1:${account.torPort}`);
     return ses;
@@ -223,8 +240,7 @@ function createMainWindow() {
 // ─────────────────────────────────────────────
 function wait(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
-async function verifyBrowserRoute(account) {
-    const ses = runtimeManager.get(account.id)?.session;
+async function fetchExternalRoute(ses) {
     if (!ses) throw new Error("A sessão Chromium desta conta ainda não está pronta");
 
     let lastError;
@@ -243,7 +259,7 @@ async function verifyBrowserRoute(account) {
             const payload = await response.json();
             const ip = payload.IP || payload.ip;
             if (!net.isIP(ip)) throw new Error("Servidor de verificação não retornou um IP válido");
-            return { ip, isTor: payload.IsTor === true, checkedAt: Date.now() };
+            return { reachable: true, ip, isTor: payload.IsTor === true, checkedAt: Date.now() };
         } catch (error) {
             lastError = error;
             if (attempt < 2) await wait(500 * (attempt + 1));
@@ -254,27 +270,23 @@ async function verifyBrowserRoute(account) {
     throw new Error(`Não foi possível verificar a rota Chromium: ${lastError?.message || "erro de rede"}`);
 }
 
-async function checkForLeaks(accountId) {
+async function checkForLeaks(accountId, force = false) {
     const account = getAccounts().find(a => a.id === Number(accountId));
     if (!account) throw new Error("Conta não encontrada");
     const runtime = runtimeManager.get(account.id);
-    let route;
-    try {
-        route = await verifyBrowserRoute(account);
-    } catch (error) {
-        runtime?.reportRoute({ reachable: false });
-        throw error;
-    }
+    if (!runtime) throw new Error("Runtime da conta não está ativo");
+    const route = await runtime.verifyExternalRoute({ force, reason: force ? "manual" : "renderer-refresh" });
     const hasLeak = route.isTor !== true;
-    runtime?.reportRoute({ reachable: true, isTor: route.isTor });
-    const message = hasLeak
+    const message = !route.reachable
+        ? `A rota Chromium não respondeu: ${route.error || "erro de rede"}`
+        : hasLeak
         ? "A rota Chromium não foi reconhecida como conexão Tor"
         : "Rota Chromium confirmada pela rede Tor";
     writeAccountLog(account.id, hasLeak ? "error" : "info", message, {
         browserIP: route.ip,
         isTor: route.isTor
     });
-    return { accountId: account.id, ip: route.ip, hasLeak, verified: route.isTor === true, message };
+    return { accountId: account.id, ip: route.ip, hasLeak, reachable: route.reachable, verified: route.isTor === true, message };
 }
 
 ipcMain.handle("get-account-info", () => {
@@ -303,8 +315,8 @@ ipcMain.handle("get-account-health", (_, accountId) => {
 });
 
 // ── Leak Detection IPC ──
-ipcMain.handle("check-leaks", async (_, { accountId } = {}) => {
-    return checkForLeaks(accountId);
+ipcMain.handle("check-leaks", async (_, { accountId, force = false } = {}) => {
+    return checkForLeaks(accountId, force === true);
 });
 
 ipcMain.handle("get-workspace", () => ({
@@ -338,13 +350,14 @@ ipcMain.handle("create-group", async (_, { name, accountCount }) => {
     newAccounts.forEach(ensureTorFiles);
     saveGroups();
 
-    try {
-        await Promise.all(newAccounts.map(account => runtimeManager.ensure(account).start()));
-    } catch (error) {
-        await Promise.allSettled(newAccounts.map(account => runtimeManager.destroy(account.id)));
-        groups = groups.filter(item => item.id !== groupId);
-        saveGroups();
-        throw error;
+    const startup = await runtimeManager.startAll(newAccounts);
+    const failures = startup.filter(item => item.status === "rejected");
+    if (failures.length) {
+        writeLog("warn", "Some profiles failed during group startup", {
+            groupId,
+            failedProfileIds: failures.map(item => item.profile.id),
+            errors: failures.map(item => item.error?.message || "unknown")
+        });
     }
 
     if (mainWin && !mainWin.isDestroyed()) {
@@ -419,14 +432,12 @@ ipcMain.handle("add-account", async (_, groupId) => {
     ensureTorFiles(details);
     saveGroups();
 
-    try {
-        await runtimeManager.ensure(details).start();
-    } catch (error) {
-        await runtimeManager.destroy(details.id);
-        group.accounts = group.accounts.filter(item => item.id !== accountId);
-        saveGroups();
-        throw error;
-    }
+    await runtimeManager.ensure(details).start().catch(error => {
+        writeLog("warn", "New profile runtime failed to start and remains recoverable", {
+            accountId: details.id,
+            error: error.message
+        });
+    });
 
     const result = {
         id: details.id, name: details.name, batchId: details.batchId, batchName: details.batchName,
@@ -560,37 +571,23 @@ ipcMain.handle("tor-new-identity", async (_, accountId) => {
     const runtime = runtimeManager.get(account.id);
     if (!runtime) throw new Error("Runtime da conta não está ativo");
 
-    return runtime.runOperation(async () => {
-        const previousRoute = await verifyBrowserRoute(account).catch(() => null);
-        const controller = await openTorController(account);
-        try {
-            await authenticateSafeCookie(controller, account);
-            await controller.command("SIGNAL NEWNYM");
-        } finally {
-            controller.close();
-        }
-
-        if (runtime.session) await runtime.session.closeAllConnections();
-
-        let route;
-        for (let attempt = 0; attempt < 3; attempt++) {
-            await wait(1500 * (attempt + 1));
-            route = await verifyBrowserRoute(account);
-            if (route.isTor) break;
-        }
-        if (!route?.isTor) throw new Error("O novo circuito não foi reconhecido como rota Tor");
-
-        runtime.reportRoute({ reachable: true, isTor: true });
-        const changed = previousRoute?.ip ? previousRoute.ip !== route.ip : null;
-        const message = changed === false
-            ? "Novo circuito confirmado; o relay de saída manteve o mesmo IP"
-            : "Novo circuito e rota Chromium confirmados";
-        writeAccountLog(account.id, "info", message, {
-            previousIP: previousRoute?.ip || null,
-            newIP: route.ip,
-            changed
+    return runtime.runOperation("newnym", async () => {
+        const result = await rotateIdentity({
+            getRoute: reason => runtime.verifyExternalRoute({ force: true, reason }),
+            signalNewnym: async () => {
+                const controller = await openTorController(account);
+                try {
+                    await authenticateSafeCookie(controller, account);
+                    await controller.command("SIGNAL NEWNYM");
+                } finally {
+                    controller.close();
+                }
+            },
+            resetConnections: () => runtime.session?.closeAllConnections() || Promise.resolve(),
+            wait
         });
-        return { previousIP: previousRoute?.ip || null, newIP: route.ip, changed, verified: true, message };
+        writeAccountLog(account.id, result.signalSucceeded ? "info" : "error", result.message, result);
+        return result;
     });
 });
 
@@ -609,17 +606,26 @@ ipcMain.on("open-devtools", (event, accountId) => {
 // ─────────────────────────────────────────────
 // Encerramento limpo
 // ─────────────────────────────────────────────
+let shutdownPromise = null;
+let quitAfterShutdown = false;
+
 function stopAllRuntimes() {
-    if (shutdownStarted) return;
-    shutdownStarted = true;
+    if (shutdownPromise) return shutdownPromise;
     console.log("\nEncerrando runtimes de perfil...");
-    void runtimeManager.stopAll();
+    shutdownPromise = runtimeManager.stopAll();
+    return shutdownPromise;
 }
 
-app.on("before-quit", stopAllRuntimes);
+app.on("before-quit", event => {
+    if (quitAfterShutdown) return;
+    event.preventDefault();
+    void stopAllRuntimes().finally(() => {
+        quitAfterShutdown = true;
+        app.quit();
+    });
+});
 app.on("window-all-closed", () => {
     if (process.platform !== "darwin") {
-        stopAllRuntimes();
         app.quit();
     }
 });
@@ -643,97 +649,13 @@ app.whenReady().then(async () => {
 
     // 3. Inicia um runtime autoritativo por perfil em paralelo.
     console.log(`\n🧅 Iniciando ${accounts.length} runtimes de perfil em paralelo...\n`);
-    try {
-        await Promise.all(accounts.map(account => runtimeManager.ensure(account).start()));
-    } catch (err) {
-        console.error("\n❌ Falha ao iniciar Tor:", err.message);
-        console.error("Verifique se o tor.exe existe em:", TOR_EXE);
-        if (mainWin && !mainWin.isDestroyed()) {
-            mainWin.webContents.send("tor-boot-error", err.message);
-        }
-        app.quit();
-        return;
-    }
-
-    console.log("\n✅ Todos os runtimes estão prontos!\n");
+    const startup = await runtimeManager.startAll(accounts);
+    const failed = startup.filter(item => item.status === "rejected");
+    console.log(`\n✅ ${startup.length - failed.length} runtimes prontos; ${failed.length} com falha recuperável.\n`);
 
     // 4. Sinaliza ao renderer que o boot terminou
     if (mainWin && !mainWin.isDestroyed()) {
         mainWin.webContents.send("tor-boot-complete");
     }
 
-    // 5. Verifica IPs no console (log lateral)
-    console.log(`\n🔍 Verificando IPs de ${accounts.length} sessões...\n`);
-    for (const account of accounts) {
-        try {
-            const ip = await checkIPviaSocks(account.torPort);
-            console.log(`  [${account.name}] IP público: ${ip}`);
-        } catch (e) {
-            console.log(`  [${account.name}] Não foi possível checar IP: ${e.message}`);
-        }
-    }
 });
-
-// ─────────────────────────────────────────────
-// Verifica IP via SOCKS5 (Node.js side)
-// ─────────────────────────────────────────────
-function checkIPviaSocks(port) {
-    return new Promise((resolve, reject) => {
-        const socket = net.createConnection({ host: "127.0.0.1", port }, () => {
-            socket.write(Buffer.from([0x05, 0x01, 0x00]));
-        });
-
-        let step = 0;
-        socket.on("data", (data) => {
-            if (step === 0) {
-                if (data[0] === 0x05 && data[1] === 0x00) {
-                    step = 1;
-                    const host = "api.ipify.org";
-                    const hostBuf = Buffer.from(host);
-                    const req = Buffer.alloc(7 + hostBuf.length);
-                    req[0] = 0x05; req[1] = 0x01; req[2] = 0x00; req[3] = 0x03;
-                    req[4] = hostBuf.length;
-                    hostBuf.copy(req, 5);
-                    req.writeUInt16BE(443, 5 + hostBuf.length);
-                    socket.write(req);
-                }
-            } else if (step === 1) {
-                if (data[1] === 0x00) {
-                    const tlsSocket = require("tls").connect({
-                        socket,
-                        servername: "api.ipify.org",
-                        rejectUnauthorized: true
-                    }, () => {
-                        tlsSocket.write(
-                            "GET /?format=json HTTP/1.1\r\n" +
-                            "Host: api.ipify.org\r\n" +
-                            "Connection: close\r\n\r\n"
-                        );
-                    });
-
-                    let body = "";
-                    tlsSocket.on("data", d => body += d.toString());
-                    tlsSocket.on("end", () => {
-                        try {
-                            const json = JSON.parse(body.split("\r\n\r\n")[1]);
-                            resolve(json.ip);
-                        } catch {
-                            reject(new Error("Resposta inválida: " + body.slice(0, 100)));
-                        }
-                    });
-                    tlsSocket.on("error", reject);
-                    step = 2;
-                } else {
-                    reject(new Error(`SOCKS5 erro: código ${data[1]}`));
-                    socket.destroy();
-                }
-            }
-        });
-
-        socket.on("error", reject);
-        socket.setTimeout(20000, () => {
-            socket.destroy();
-            reject(new Error("Timeout SOCKS5"));
-        });
-    });
-}

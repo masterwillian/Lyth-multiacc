@@ -19,19 +19,35 @@ function launchTorProcess(profile, options) {
     let readySettled = false;
     let bootstrapped = false;
     let timeout;
+    let stopped = false;
+    let handleOutput;
+    let handleError;
+    let handleExit;
+    let rejectReady;
+
+    const removeListeners = () => {
+        child.stdout.removeListener("data", handleOutput);
+        child.stderr.removeListener("data", handleOutput);
+        child.removeListener("error", handleError);
+        child.removeListener("exit", handleExit);
+    };
 
     const ready = new Promise((resolve, reject) => {
+        rejectReady = reject;
         const fail = error => {
             if (readySettled) return;
             readySettled = true;
             clearTimeout(timeout);
+            removeListeners();
             try {
                 if (child.exitCode === null && !child.killed) child.kill();
-            } catch (_) {}
+            } catch (killError) {
+                options.onCleanupError?.(killError);
+            }
             reject(error);
         };
 
-        const handleOutput = chunk => {
+        handleOutput = chunk => {
             const text = chunk.toString();
             onOutput(text);
             const match = text.match(/Bootstrapped (\d+)%/);
@@ -50,13 +66,18 @@ function launchTorProcess(profile, options) {
             }
         };
 
+        handleError = error => fail(error);
+        handleExit = code => {
+            clearTimeout(timeout);
+            removeListeners();
+            if (!bootstrapped && !stopped) fail(new Error(`Tor encerrou antes do bootstrap (code=${code})`));
+            onExit(code, bootstrapped);
+        };
+
         child.stdout.on("data", handleOutput);
         child.stderr.on("data", handleOutput);
-        child.once("error", fail);
-        child.once("exit", code => {
-            if (!bootstrapped) fail(new Error(`Tor encerrou antes do bootstrap (code=${code})`));
-            onExit(code, bootstrapped);
-        });
+        child.once("error", handleError);
+        child.once("exit", handleExit);
 
         timeout = setTimeout(() => {
             fail(new Error(`Timeout ao aguardar bootstrap do Tor ${profile.torPort}`));
@@ -67,8 +88,19 @@ function launchTorProcess(profile, options) {
         process: child,
         ready,
         stop() {
+            if (stopped) return;
+            stopped = true;
             clearTimeout(timeout);
-            if (child.exitCode === null && !child.killed) child.kill();
+            removeListeners();
+            if (!readySettled) {
+                readySettled = true;
+                rejectReady(new Error("Inicialização do Tor interrompida"));
+            }
+            try {
+                if (child.exitCode === null && !child.killed) child.kill();
+            } catch (error) {
+                options.onCleanupError?.(error);
+            }
         }
     };
 }

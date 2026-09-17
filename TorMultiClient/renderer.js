@@ -177,7 +177,7 @@ mc.onBootstrapProgress(({ id, pct }) => {
 // Boot completo — fade-out da splash E carrega URLs nas webviews
 mc.onBootComplete(() => {
     appBootCompleted = true;
-    splashStatus.textContent = "✅ Todos prontos! Carregando…";
+    splashStatus.textContent = "✅ Inicialização concluída. Carregando…";
     
     // Carrega URLs nas webviews agora que o proxy está pronto
     Object.keys(webviews).forEach(accountId => {
@@ -302,7 +302,7 @@ async function refreshAccountIP(account, force = false) {
     ipBadge.className = "ip-badge loading";
     ipBadge.textContent = "Verificando IP…";
     try {
-        const route = await mc.checkLeaks({ accountId: account.id });
+        const route = await mc.checkLeaks({ accountId: account.id, force });
         if (route.hasLeak) {
             ipBadge.className = "ip-badge error";
             ipBadge.textContent = "⚠ rota fora do Tor";
@@ -733,6 +733,9 @@ function createAccountPanel(account) {
         }
         wv.remove();
     });
+    mc.getAccountHealth(account.id)
+        .then(statusState => updateAccountStatus(account.id, statusState))
+        .catch(() => {});
 }
 
 // Cria painéis, mas não carrega URLs de imediato
