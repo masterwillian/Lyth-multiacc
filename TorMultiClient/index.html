@@ -2,7 +2,7 @@
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <title>MultiClient — 4 IPs via Tor</title>
+    <title>Lyth</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
@@ -165,81 +165,6 @@
             text-align: center;
             font-style: italic;
             min-height: 18px;
-        }
-
-        /* ══════════════════════════════════════
-           TOPBAR
-        ══════════════════════════════════════ */
-        #topbar {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            padding: 0 14px;
-            background: var(--bg2);
-            border-bottom: 1px solid var(--border);
-            height: 44px;
-            flex-shrink: 0;
-            -webkit-app-region: drag;
-        }
-
-        #topbar > * { -webkit-app-region: no-drag; }
-
-        .topbar-logo {
-            font-size: 16px;
-            margin-right: 2px;
-        }
-
-        #topbar h1 {
-            font-size: 13px;
-            font-weight: 600;
-            color: var(--text);
-            letter-spacing: -0.2px;
-            white-space: nowrap;
-        }
-
-        .topbar-sep {
-            width: 1px;
-            height: 18px;
-            background: var(--border2);
-            margin: 0 4px;
-        }
-
-        .topbar-info {
-            font-size: 11px;
-            color: var(--text3);
-            white-space: nowrap;
-        }
-
-        .topbar-spacer { flex: 1; }
-
-        /* Layout toggle buttons */
-        .layout-btns {
-            display: flex;
-            gap: 4px;
-        }
-
-        .layout-btn {
-            padding: 4px 9px;
-            background: transparent;
-            border: 1px solid var(--border2);
-            border-radius: 5px;
-            color: var(--text3);
-            font-size: 11px;
-            cursor: pointer;
-            transition: all 0.15s;
-            font-family: 'Inter', sans-serif;
-        }
-
-        .layout-btn:hover {
-            background: var(--bg3);
-            color: var(--text2);
-            border-color: var(--border2);
-        }
-
-        .layout-btn.active {
-            background: var(--accent2);
-            border-color: var(--accent);
-            color: #fff;
         }
 
         /* ══════════════════════════════════════
@@ -438,7 +363,7 @@
         }
 
         #grid {
-            --grid-columns: 1;
+            --grid-columns: 3;
             display: grid;
             flex: 1;
             gap: 4px;
@@ -453,21 +378,9 @@
             align-content: start;
         }
 
-        #grid.layout-2x2 {
-            grid-template-columns: repeat(2, minmax(0, 1fr));
-            grid-auto-rows: minmax(220px, 1fr);
-        }
-
-        #grid.layout-1x4 {
-            grid-template-columns: repeat(4, minmax(0, 1fr));
-            grid-auto-rows: minmax(220px, 1fr);
-        }
-
         #grid.layout-focus .cell { display: none; }
         #grid.layout-focus .cell.focused { display: flex; }
         #grid { overflow: auto; align-content: start; }
-        #grid.layout-2x2 { grid-auto-rows: minmax(220px, 420px); }
-        #grid.layout-1x4 { grid-auto-rows: minmax(220px, 420px); }
         #grid.layout-focus {
             grid-template-columns: minmax(0, 1fr);
             grid-template-rows: minmax(0, 1fr);
@@ -838,7 +751,7 @@
 <div id="splash">
     <div class="splash-logo">
         <div class="splash-onion">🧅</div>
-        <div class="splash-title">MultiClient</div>
+        <div class="splash-title">Lyth</div>
         <div class="splash-subtitle">Iniciando instâncias Tor…</div>
     </div>
 
@@ -851,18 +764,6 @@
 
 <!-- ══════════ APP ══════════ -->
 <div id="app">
-    <div id="topbar">
-        <span class="topbar-logo">🧅</span>
-        <h1>MultiClient</h1>
-        <div class="topbar-sep"></div>
-        <span class="topbar-info">Sessões isoladas · IPs independentes via Tor</span>
-        <div class="topbar-spacer"></div>
-        <div class="layout-btns">
-            <button class="layout-btn active" id="btn-layout-2x2" data-layout="2x2" title="Grid 2×2">⊞ 2×2</button>
-            <button class="layout-btn" id="btn-layout-1x4" data-layout="1x4" title="Linha 1×4">⊟ 1×4</button>
-        </div>
-    </div>
-
     <div class="workspace">
         <aside id="sidebar">
             <div class="sidebar-heading"><span>Grupos</span><button id="new-group-btn" title="Criar grupo">+</button></div>
@@ -872,7 +773,7 @@
             <button id="add-account-btn">+ Conta no lote</button>
         </aside>
         <div id="group-context-menu" aria-label="Menu do lote"></div>
-        <div id="grid" class="layout-2x2"></div>
+        <div id="grid"></div>
     </div>
 </div>
 

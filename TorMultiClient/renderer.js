@@ -49,10 +49,10 @@ function getOrderedAccountIds() {
 }
 
 function updateOverviewGridLayout() {
-    if (grid.dataset.view !== "overview" || grid.classList.contains("layout-focus")) return;
-    const total = accounts.length || 1;
-    const columns = Math.max(1, Math.ceil(Math.sqrt(total)));
-    grid.style.gridTemplateColumns = `repeat(${columns}, minmax(0, 1fr))`;
+    if (grid.classList.contains("layout-focus")) return;
+    // The workspace stays modular through additional rows, while keeping three
+    // readable account panels per row.
+    grid.style.gridTemplateColumns = "repeat(3, minmax(0, 1fr))";
     grid.style.gridAutoRows = "minmax(220px, 1fr)";
 }
 
@@ -186,6 +186,12 @@ mc.onBootComplete(() => {
             wv.src = initialUrl;
         }
     });
+    accounts.forEach(account => refreshAccountIP(account));
+    // A rota pública da conta é checada em um intervalo fixo, sem depender do
+    // site atualmente aberto dentro da webview.
+    setInterval(() => {
+        accounts.forEach(account => refreshAccountIP(account));
+    }, 60_000);
     
     setTimeout(() => {
         splash.classList.add("hidden");
@@ -216,34 +222,17 @@ console.log(`
 
 let focusedAccountId = null;
 
-document.querySelectorAll(".layout-btn").forEach(btn => {
-    btn.addEventListener("click", () => {
-        const layout = btn.dataset.layout;
-        setLayout(layout);
-    });
-});
-
-function setLayout(layout) {
-    document.querySelectorAll(".layout-btn").forEach(b => b.classList.remove("active"));
-    const btn = document.querySelector(`[data-layout="${layout}"]`);
-    if (btn) btn.classList.add("active");
-
-    grid.className = `layout-${layout}`;
+function exitFocus() {
+    grid.classList.remove("layout-focus");
+    document.querySelectorAll(".cell").forEach(cell => cell.classList.remove("focused"));
+    focusedAccountId = null;
+    updateOverviewGridLayout();
     applyVisibleAccounts();
-
-    // Ao sair do foco, restaura todas as células
-    if (layout !== "focus") {
-        document.querySelectorAll(".cell").forEach(c => c.classList.remove("focused"));
-        focusedAccountId = null;
-        applyVisibleAccounts();
-    }
 }
 
 function focusCell(accountId) {
     focusedAccountId = accountId;
-    setLayout("focus");
-
-    document.querySelectorAll(".layout-btn").forEach(b => b.classList.remove("active"));
+    grid.classList.add("layout-focus");
 
     document.querySelectorAll(".cell").forEach(c => {
         c.classList.remove("focused");
@@ -272,6 +261,45 @@ function applyVisibleAccounts() {
 // Referências globais por conta (para New Identity e DevTools)
 const webviews = {};
 const ipBadges = {};
+const routeChecksInFlight = new Set();
+const lastRouteCheckAt = new Map();
+
+function showIPBadge(account, ip, message) {
+    const ipBadge = ipBadges[account.id];
+    if (!ipBadge) return;
+    ipBadge.className = "ip-badge ready";
+    ipBadge.textContent = ip;
+    ipBadge.title = message;
+    saveIp(account.id, ip);
+}
+
+async function refreshAccountIP(account, force = false) {
+    const ipBadge = ipBadges[account.id];
+    if (!ipBadge) return;
+    if (routeChecksInFlight.has(account.id)) return;
+    const lastCheck = lastRouteCheckAt.get(account.id) || 0;
+    if (!force && Date.now() - lastCheck < 15000) return;
+    routeChecksInFlight.add(account.id);
+    ipBadge.className = "ip-badge loading";
+    ipBadge.textContent = "Verificando IP…";
+    try {
+        const route = await mc.checkLeaks({ accountId: account.id });
+        if (route.hasLeak) {
+            ipBadge.className = "ip-badge error";
+            ipBadge.textContent = "⚠ rota fora do Tor";
+            ipBadge.title = route.message;
+            return;
+        }
+        showIPBadge(account, route.ip, `${route.message} · clique para atualizar`);
+    } catch (error) {
+        ipBadge.className = "ip-badge error";
+        ipBadge.textContent = "IP não verificado";
+        ipBadge.title = error.message || "Falha ao validar a rota Chromium";
+    } finally {
+        lastRouteCheckAt.set(account.id, Date.now());
+        routeChecksInFlight.delete(account.id);
+    }
+}
 
 function updateAccountStatus(accountId, statusState) {
     const indicator = document.querySelector(`.account-status[data-account-id="${accountId}"]`);
@@ -390,6 +418,7 @@ function createAccountPanel(account) {
     ipBadge.className = "ip-badge loading";
     ipBadge.textContent = `Tor :${account.torPort}`;
     ipBadges[account.id] = ipBadge;
+    ipBadge.addEventListener("click", () => refreshAccountIP(account, true));
 
     const ipHistoryBtn = document.createElement("button");
     ipHistoryBtn.className = "action-btn";
@@ -417,9 +446,11 @@ function createAccountPanel(account) {
         ipBadge.textContent = "Trocando IP…";
 
         try {
-            await mc.newIdentity(account.id);
-            // Dá tempo para o Tor criar o novo circuito antes da consulta.
-            await delay(4000);
+            const result = await mc.newIdentity(account.id);
+            ipBadge.className = "ip-badge ready";
+            ipBadge.textContent = result.newIP;
+            ipBadge.title = result.message;
+            saveIp(account.id, result.newIP);
             const wv = webviews[account.id];
             if (wv) wv.reloadIgnoringCache();
         } catch (e) {
@@ -453,7 +484,7 @@ function createAccountPanel(account) {
 
     focusBtn.addEventListener("click", () => {
         if (grid.classList.contains("layout-focus") && focusedAccountId === account.id) {
-            setLayout("2x2");
+            exitFocus();
         } else {
             focusCell(account.id);
         }
@@ -549,91 +580,8 @@ function createAccountPanel(account) {
         fwdBtn.disabled   = !wv.canGoForward();
     });
 
-    // — Detecção de IP + Canvas Fingerprinting Protection ──
-    wv.addEventListener("did-finish-load", () => {
-        // Injeta proteção contra Canvas Fingerprinting
-        const canvasProtectionScript = `
-(function() {
-    // Protege Canvas.toDataURL
-    const originalToDataURL = HTMLCanvasElement.prototype.toDataURL;
-    HTMLCanvasElement.prototype.toDataURL = function(type) {
-        if (this.width === 0 || this.height === 0) {
-            return originalToDataURL.call(this, type);
-        }
-        const ctx = this.getContext('2d');
-        if (ctx) {
-            ctx.fillStyle = 'rgba(' + Math.floor(Math.random()*256) + ',' + Math.floor(Math.random()*256) + ',' + Math.floor(Math.random()*256) + ',0.5)';
-            ctx.fillRect(0, 0, 1, 1);
-        }
-        return originalToDataURL.call(this, type);
-    };
-    
-    // Protege Canvas.toBlob
-    const originalToBlob = HTMLCanvasElement.prototype.toBlob;
-    HTMLCanvasElement.prototype.toBlob = function(callback, type, quality) {
-        const ctx = this.getContext('2d');
-        if (ctx && this.width > 0 && this.height > 0) {
-            ctx.fillStyle = 'rgba(' + Math.floor(Math.random()*256) + ',' + Math.floor(Math.random()*256) + ',' + Math.floor(Math.random()*256) + ',0.5)';
-            ctx.fillRect(0, 0, 1, 1);
-        }
-        return originalToBlob.call(this, callback, type, quality);
-    };
-    
-    // Protege WebGL Fingerprinting
-    const getParameter = WebGLRenderingContext.prototype.getParameter;
-    WebGLRenderingContext.prototype.getParameter = function(parameter) {
-        if (parameter === 37445) return 'Intel Inc.';
-        if (parameter === 37446) return 'Intel Iris OpenGL Engine';
-        return getParameter.call(this, parameter);
-    };
-    
-    // Protege WebGL2
-    if (WebGL2RenderingContext) {
-        const getParameter2 = WebGL2RenderingContext.prototype.getParameter;
-        WebGL2RenderingContext.prototype.getParameter = function(parameter) {
-            if (parameter === 37445) return 'Intel Inc.';
-            if (parameter === 37446) return 'Intel Iris OpenGL Engine';
-            return getParameter2.call(this, parameter);
-        };
-    }
-})();
-`;
-        try {
-            wv.executeJavaScript(canvasProtectionScript);
-        } catch (e) {
-            console.log('Canvas protection injection skipped');
-        }
-
-        // Detecção de IP
-        wv.executeJavaScript(`
-            (() => {
-                const txt = document.body ? document.body.innerText.trim() : "";
-                try {
-                    const obj = JSON.parse(txt);
-                    if (obj.ip) return obj.ip;
-                } catch (_) {}
-                const m = txt.match(/\\b(\\d{1,3}\\.){3}\\d{1,3}\\b/);
-                return m ? m[0] : null;
-            })()
-        `).then(ip => {
-            if (ip) {
-                saveIp(account.id, ip);
-                ipBadge.className = "ip-badge ready";
-                ipBadge.textContent = `${ip}`;
-            } else {
-                ipBadge.className = "ip-badge loading";
-                ipBadge.textContent = `Tor :${account.torPort}`;
-            }
-        }).catch(() => {
-            ipBadge.className = "ip-badge loading";
-            ipBadge.textContent = `Tor :${account.torPort}`;
-        });
-    });
-
     wv.addEventListener("did-fail-load", (e) => {
-        if (e.errorCode === -3) return;
-        ipBadge.className = "ip-badge error";
-        ipBadge.textContent = `⚠ ${e.errorCode}`;
+        if (e.errorCode === -3 || e.isMainFrame === false) return;
         reloadBtn.style.display = "flex";
         stopBtn.style.display = "none";
     });
@@ -971,7 +919,7 @@ document.getElementById("add-account-btn").addEventListener("click", async () =>
 
 function setActiveGroup(groupId) {
     activeGroupId = groupId;
-    if (grid.classList.contains("layout-focus")) setLayout("2x2");
+    if (grid.classList.contains("layout-focus")) exitFocus();
     grid.dataset.view = "group";
     document.querySelectorAll(".group-btn").forEach(button => {
         button.classList.toggle("active", Number(button.dataset.groupId) === groupId);
