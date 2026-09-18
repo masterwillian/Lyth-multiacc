@@ -2,11 +2,9 @@
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: http: https:; font-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src about: http: https:">
     <title>Lyth</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
     <style>
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
-
         * {
             margin: 0;
             padding: 0;
@@ -742,6 +740,33 @@
         }
         .bookmark-menu::-webkit-scrollbar-thumb:hover {
             background: #555;
+        }
+        .bookmark-menu-row {
+            padding: 8px;
+            border-bottom: 1px solid #333;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .bookmark-menu-row:hover { background: #333; }
+        .bookmark-menu-link {
+            flex: 1;
+            min-width: 0;
+            border: 0;
+            background: transparent;
+            color: var(--text);
+            cursor: pointer;
+            overflow: hidden;
+            text-align: left;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            font-size: 12px;
+        }
+        .bookmark-menu-remove {
+            border: 0;
+            background: transparent;
+            color: var(--red);
+            cursor: pointer;
         }
     </style>
 </head>

@@ -1,65 +1,57 @@
 const { contextBridge, ipcRenderer } = require("electron");
 
-contextBridge.exposeInMainWorld("multiClient", {
-    getVersion: () => ipcRenderer.invoke("get-app-version"),
+function invoke(channel) {
+    return (...args) => ipcRenderer.invoke(channel, ...args);
+}
 
-    getWorkspace: () => ipcRenderer.invoke("get-workspace"),
-    createGroup: (data) => ipcRenderer.invoke("create-group", data),
-    updateGroup: (data) => ipcRenderer.invoke("update-group", data),
-    deleteGroup: (groupId) => ipcRenderer.invoke("delete-group", groupId),
-    renameAccount: (data) => ipcRenderer.invoke("rename-account", data),
-    addAccount: (groupId) => ipcRenderer.invoke("add-account", groupId),
-    removeAccount: (accountId) => ipcRenderer.invoke("remove-account", accountId),
-    onGroupCreated: (callback) => {
-        ipcRenderer.on("group-created", (_, data) => callback(data));
-    },
-    onGroupDeleted: (callback) => {
-        ipcRenderer.on("group-deleted", (_, groupId) => callback(groupId));
-    },
-    onAccountAdded: (callback) => {
-        ipcRenderer.on("account-added", (_, account) => callback(account));
-    },
-    onAccountRemoved: (callback) => {
-        ipcRenderer.on("account-removed", (_, accountId) => callback(accountId));
-    },
+function subscribe(channel, { once = false } = {}) {
+    return callback => {
+        if (typeof callback !== "function") throw new TypeError("callback must be a function");
+        const listener = (_event, ...args) => callback(...args);
+        if (once) ipcRenderer.once(channel, listener);
+        else ipcRenderer.on(channel, listener);
+        return () => ipcRenderer.removeListener(channel, listener);
+    };
+}
 
-    // Solicita novo circuito Tor para uma conta
-    newIdentity: (accountId) => ipcRenderer.invoke("tor-new-identity", accountId),
+const api = {
+    app: Object.freeze({
+        getVersion: invoke("get-app-version")
+    }),
+    workspace: Object.freeze({
+        get: invoke("get-workspace"),
+        createGroup: invoke("create-group"),
+        updateGroup: invoke("update-group"),
+        deleteGroup: invoke("delete-group"),
+        onGroupCreated: subscribe("group-created")
+    }),
+    profiles: Object.freeze({
+        rename: invoke("rename-account"),
+        add: invoke("add-account"),
+        remove: invoke("remove-account"),
+        onAdded: subscribe("account-added"),
+        onRemoved: subscribe("account-removed")
+    }),
+    tor: Object.freeze({
+        newIdentity: invoke("tor-new-identity"),
+        getCircuitInfo: invoke("get-circuit-info"),
+        onBootstrapProgress: subscribe("bootstrap-progress"),
+        onBootComplete: subscribe("tor-boot-complete", { once: true }),
+        onBootError: subscribe("tor-boot-error", { once: true })
+    }),
+    health: Object.freeze({
+        get: invoke("get-account-health"),
+        checkRoute: invoke("check-leaks"),
+        onUpdate: subscribe("account-health-update")
+    }),
+    storage: Object.freeze({
+        importLegacyRendererData: invoke("storage-import-legacy-renderer"),
+        setOverviewOrder: invoke("storage-set-overview-order"),
+        setLastUrl: invoke("storage-set-last-url"),
+        addNavigationHistory: invoke("storage-add-navigation-history"),
+        replaceBookmarks: invoke("storage-replace-bookmarks"),
+        addIpHistory: invoke("storage-add-ip-history")
+    })
+};
 
-    // Abre DevTools de uma webview (retransmitido pelo main)
-    openDevTools: (accountId) => ipcRenderer.send("open-devtools", accountId),
-
-    // Escuta progresso de bootstrap (0–100) de cada instância
-    onBootstrapProgress: (callback) => {
-        ipcRenderer.on("bootstrap-progress", (_, data) => callback(data));
-    },
-
-    // Escuta alteração de status e saúde da conta
-    onAccountHealth: (callback) => {
-        ipcRenderer.on("account-health-update", (_, data) => callback(data));
-    },
-
-    // Solicita o estado atual de saúde da conta
-    getAccountHealth: (accountId) => ipcRenderer.invoke("get-account-health", accountId),
-
-    // Escuta conclusão do boot completo
-    onBootComplete: (callback) => {
-        ipcRenderer.once("tor-boot-complete", () => callback());
-    },
-
-    // Escuta erros de boot
-    onBootError: (callback) => {
-        ipcRenderer.once("tor-boot-error", (_, msg) => callback(msg));
-    },
-
-    // Recebe sinal para abrir DevTools (enviado pelo main como retransmissão)
-    onOpenDevTools: (callback) => {
-        ipcRenderer.on("open-devtools-reply", (_, accountId) => callback(accountId));
-    },
-
-    // Leak Detection
-    checkLeaks: (payload) => ipcRenderer.invoke("check-leaks", payload),
-
-    // Tor Circuit Info
-    getCircuitInfo: (accountId) => ipcRenderer.invoke("get-circuit-info", accountId),
-});
+contextBridge.exposeInMainWorld("lyth", Object.freeze(api));

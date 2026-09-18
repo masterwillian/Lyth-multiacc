@@ -1,7 +1,26 @@
-// renderer.js — Processo renderer (sem Node.js direto)
-// Acessa APIs via window.multiClient (contextBridge)
-
-const mc      = window.multiClient;
+// renderer.js — processo renderer sandboxed, sem acesso direto ao Node.js.
+const api = window.lyth;
+const mc = {
+    getWorkspace: api.workspace.get,
+    createGroup: api.workspace.createGroup,
+    updateGroup: api.workspace.updateGroup,
+    deleteGroup: api.workspace.deleteGroup,
+    renameAccount: api.profiles.rename,
+    addAccount: api.profiles.add,
+    removeAccount: api.profiles.remove,
+    onGroupCreated: api.workspace.onGroupCreated,
+    onAccountAdded: api.profiles.onAdded,
+    onAccountRemoved: api.profiles.onRemoved,
+    newIdentity: api.tor.newIdentity,
+    getCircuitInfo: api.tor.getCircuitInfo,
+    onBootstrapProgress: api.tor.onBootstrapProgress,
+    onBootComplete: api.tor.onBootComplete,
+    onBootError: api.tor.onBootError,
+    checkLeaks: api.health.checkRoute,
+    getAccountHealth: api.health.get,
+    onAccountHealth: api.health.onUpdate,
+    importLegacyRendererData: api.storage.importLegacyRendererData
+};
 const grid    = document.getElementById("grid");
 const splash  = document.getElementById("splash");
 const overviewOrderKey = "multiclient-overview-order";
@@ -12,8 +31,71 @@ const groupColors = [
     "#9b5de5", "#00bbf9", "#80ed99", "#ffb703", "#fb8500"
 ];
 
-mc.getWorkspace().then(({ accounts: initialAccounts, groups }) => {
+function safeStoredArray(key) {
+    try {
+        const value = JSON.parse(localStorage.getItem(key) || "[]");
+        return Array.isArray(value) ? value : [];
+    } catch { return []; }
+}
+
+function safeStoredUrl(value) {
+    try {
+        const url = new URL(value);
+        return ["http:", "https:"].includes(url.protocol) ? url.href : null;
+    } catch { return null; }
+}
+
+function collectLegacyRendererData() {
+    const profiles = {};
+    const ensure = id => profiles[id] ||= { bookmarks: [], urlHistory: [], ipHistory: [], lastUrl: null };
+    for (let index = 0; index < localStorage.length; index++) {
+        const key = localStorage.key(index);
+        const match = /^(account-url|bookmarks|url-history|ip-history)-(\d+)$/.exec(key || "");
+        if (!match) continue;
+        const profileId = Number(match[2]);
+        if (!Number.isSafeInteger(profileId) || profileId < 1) continue;
+        const data = ensure(profileId);
+        if (match[1] === "account-url") data.lastUrl = safeStoredUrl(localStorage.getItem(key));
+        if (match[1] === "url-history") data.urlHistory = safeStoredArray(key).map(safeStoredUrl).filter(Boolean);
+        if (match[1] === "ip-history") data.ipHistory = safeStoredArray(key).filter(value => typeof value === "string");
+        if (match[1] === "bookmarks") data.bookmarks = safeStoredArray(key).map(item => ({
+            url: safeStoredUrl(item?.url),
+            title: String(item?.title || item?.url || "").slice(0, 300),
+            date: item?.date
+        })).filter(item => item.url && item.title);
+    }
+    return {
+        overviewOrder: safeStoredArray(overviewOrderKey).map(Number).filter(Number.isSafeInteger),
+        profiles
+    };
+}
+
+function clearMigratedLocalStorage(payload) {
+    localStorage.removeItem(overviewOrderKey);
+    for (const id of Object.keys(payload.profiles)) {
+        for (const prefix of ["account-url", "bookmarks", "url-history", "ip-history", "account-name"]) {
+            localStorage.removeItem(`${prefix}-${id}`);
+        }
+    }
+}
+
+const legacyRendererData = collectLegacyRendererData();
+mc.importLegacyRendererData(legacyRendererData)
+    .then(() => clearMigratedLocalStorage(legacyRendererData))
+    .catch(error => console.error("Falha ao migrar dados locais para SQLite:", error))
+    .then(() => mc.getWorkspace())
+    .then(({ accounts: initialAccounts, groups, uiState = {} }) => {
 let accounts = initialAccounts;
+const profileUiData = uiState.profiles || {};
+let overviewOrder = Array.isArray(uiState.overviewOrder) ? uiState.overviewOrder : [];
+
+function profileData(accountId) {
+    return profileUiData[accountId] ||= { lastUrl: null, bookmarks: [], urlHistory: [], ipHistory: [] };
+}
+
+function persist(promise) {
+    promise.catch(error => console.error("Falha ao persistir dados do perfil:", error));
+}
 
 function escapeHtml(value = "") {
     return String(value)
@@ -37,9 +119,11 @@ function renderGroupButtonMeta(group) {
 
 function syncOverviewOrder() {
     const validIds = accounts.map(account => account.id);
-    const stored = JSON.parse(localStorage.getItem(overviewOrderKey) || "[]");
-    const merged = [...new Set([...(stored || []).filter(id => validIds.includes(Number(id))), ...validIds])];
-    localStorage.setItem(overviewOrderKey, JSON.stringify(merged));
+    const merged = [...new Set([...(overviewOrder || []).filter(id => validIds.includes(Number(id))), ...validIds])];
+    if (JSON.stringify(merged) !== JSON.stringify(overviewOrder)) {
+        overviewOrder = merged;
+        persist(api.storage.setOverviewOrder(merged));
+    }
     return merged;
 }
 
@@ -65,7 +149,8 @@ function reorderOverview(sourceId, targetId) {
 
     order.splice(sourceIndex, 1);
     order.splice(targetIndex, 0, Number(sourceId));
-    localStorage.setItem(overviewOrderKey, JSON.stringify(order));
+    overviewOrder = order;
+    persist(api.storage.setOverviewOrder(order));
 
     const sourceCell = document.querySelector(`.cell[data-account-id="${sourceId}"]`);
     const targetCell = document.querySelector(`.cell[data-account-id="${targetId}"]`);
@@ -364,8 +449,7 @@ function createAccountPanel(account) {
     // — Label editável —
     const label = document.createElement("span");
     label.className = "cell-label";
-    const savedName = localStorage.getItem(`account-name-${account.id}`) || account.name;
-    label.textContent = savedName;
+    label.textContent = account.name;
     label.title = "Duplo clique para renomear";
 
     label.addEventListener("dblclick", () => {
@@ -382,7 +466,6 @@ function createAccountPanel(account) {
             const newName = input.value.trim() || account.name;
             label.textContent = newName;
             account.name = newName;
-            localStorage.setItem(`account-name-${account.id}`, newName);
             mc.renameAccount({ accountId: account.id, name: newName }).catch(error => {
                 console.error("Não foi possível salvar o nome da conta:", error);
             });
@@ -423,7 +506,7 @@ function createAccountPanel(account) {
     const urlInput = document.createElement("input");
     urlInput.className = "cell-url";
     urlInput.type = "text";
-    urlInput.value = localStorage.getItem(`account-url-${account.id}`) || "https://checkip.amazonaws.com/";
+    urlInput.value = profileData(account.id).lastUrl || "https://checkip.amazonaws.com/";
     urlInput.placeholder = "https://...";
     urlInput.setAttribute("list", listId);
 
@@ -466,12 +549,12 @@ function createAccountPanel(account) {
 
         try {
             const result = await mc.newIdentity(account.id);
-            ipBadge.className = "ip-badge ready";
-            ipBadge.textContent = result.newIP;
+            ipBadge.className = result.routeVerified ? "ip-badge ready" : "ip-badge error";
+            ipBadge.textContent = result.currentIP || (result.signalSucceeded ? "IP não verificado" : "Falha no ControlPort");
             ipBadge.title = result.message;
-            saveIp(account.id, result.newIP);
+            if (result.currentIP) saveIp(account.id, result.currentIP);
             const wv = webviews[account.id];
-            if (wv) wv.reloadIgnoringCache();
+            if (wv && result.signalSucceeded) wv.reloadIgnoringCache();
         } catch (e) {
             ipBadge.className = "ip-badge error";
             ipBadge.textContent = "⚠ ControlPort";
@@ -550,7 +633,8 @@ function createAccountPanel(account) {
             url = "https://" + url;
             urlInput.value = url;
         }
-        localStorage.setItem(`account-url-${account.id}`, url);
+        profileData(account.id).lastUrl = url;
+        persist(api.storage.setLastUrl({ profileId: account.id, url }));
         wv.src = url;
     }
 
@@ -566,14 +650,20 @@ function createAccountPanel(account) {
     // — Atualiza URL bar ao navegar —
     wv.addEventListener("did-navigate", e => {
         urlInput.value = e.url;
-        localStorage.setItem(`account-url-${account.id}`, e.url);
+        if (e.url !== "about:blank") {
+            profileData(account.id).lastUrl = e.url;
+            persist(api.storage.setLastUrl({ profileId: account.id, url: e.url }));
+        }
         pushHistory(account.id, e.url, datalist);
     });
 
     wv.addEventListener("did-navigate-in-page", e => {
         if (e.isMainFrame) {
             urlInput.value = e.url;
-            localStorage.setItem(`account-url-${account.id}`, e.url);
+            if (e.url !== "about:blank") {
+                profileData(account.id).lastUrl = e.url;
+                persist(api.storage.setLastUrl({ profileId: account.id, url: e.url }));
+            }
             pushHistory(account.id, e.url, datalist);
         }
     });
@@ -612,9 +702,7 @@ function createAccountPanel(account) {
     bookmarkBtn.style.fontSize = "18px";
     bookmarkBtn.style.color = "#888";
 
-    // Carrega bookmarks do localStorage
-    const bookmarksKey = `bookmarks-${account.id}`;
-    const bookmarks = JSON.parse(localStorage.getItem(bookmarksKey) || "[]");
+    const bookmarks = profileData(account.id).bookmarks;
 
     function updateBookmarkBtn() {
         const currentUrl = urlInput.value.trim();
@@ -635,7 +723,7 @@ function createAccountPanel(account) {
             bookmarks.push({ url: currentUrl, title, date: new Date().toISOString() });
         }
 
-        localStorage.setItem(bookmarksKey, JSON.stringify(bookmarks));
+        persist(api.storage.replaceBookmarks({ profileId: account.id, bookmarks }));
         updateBookmarkBtn();
     });
 
@@ -659,14 +747,41 @@ function createAccountPanel(account) {
     bookmarkMenu.style.position = "absolute";
 
     function updateBookmarkMenu() {
-        bookmarkMenu.innerHTML = bookmarks.length ? 
-            bookmarks.map((b, i) => `
-                <div style="padding: 8px; border-bottom: 1px solid #333; cursor: pointer; display: flex; justify-content: space-between; align-items: center;" onmouseover="this.style.background='#333'" onmouseout="this.style.background=''">
-                    <span onclick="document.querySelector('[data-account-id=\"${account.id}\"] .url-input').value='${b.url}'; document.querySelector('[data-account-id=\"${account.id}\"] .url-input').dispatchEvent(new Event('keydown', {key: 'Enter'}))" style="flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 12px;">${b.url}</span>
-                    <span onclick="event.stopPropagation(); bookmarks.splice(${i}, 1); localStorage.setItem('${bookmarksKey}', JSON.stringify(bookmarks)); updateBookmarkMenu();" style="cursor: pointer; color: #f00; margin-left: 8px;">✕</span>
-                </div>
-            `).join('') :
-            '<div style="padding: 8px; color: #888;">Nenhum favorito</div>';
+        bookmarkMenu.replaceChildren();
+        if (!bookmarks.length) {
+            const empty = document.createElement("div");
+            empty.style.padding = "8px";
+            empty.style.color = "#888";
+            empty.textContent = "Nenhum favorito";
+            bookmarkMenu.appendChild(empty);
+            return;
+        }
+        bookmarks.forEach((bookmark, index) => {
+            const row = document.createElement("div");
+            row.className = "bookmark-menu-row";
+            const link = document.createElement("button");
+            link.type = "button";
+            link.className = "bookmark-menu-link";
+            link.textContent = bookmark.url;
+            link.addEventListener("click", () => {
+                urlInput.value = bookmark.url;
+                navigate();
+                bookmarkMenu.style.display = "none";
+            });
+            const remove = document.createElement("button");
+            remove.type = "button";
+            remove.className = "bookmark-menu-remove";
+            remove.textContent = "✕";
+            remove.addEventListener("click", event => {
+                event.stopPropagation();
+                bookmarks.splice(index, 1);
+                persist(api.storage.replaceBookmarks({ profileId: account.id, bookmarks }));
+                updateBookmarkMenu();
+                updateBookmarkBtn();
+            });
+            row.append(link, remove);
+            bookmarkMenu.appendChild(row);
+        });
     }
 
     const bookmarkContainer = document.createElement("div");
@@ -720,7 +835,7 @@ function createAccountPanel(account) {
             } else if (e.key === 'd' || e.key === 'D') {
                 e.preventDefault();
                 // Abre DevTools
-                mc.openDevTools(account.id);
+                wv.openDevTools();
             }
         }
     };
@@ -835,7 +950,7 @@ function deleteGroup(groupId) {
     const group = groups.find(item => Number(item.id) === Number(groupId));
     if (!group) return;
 
-    const confirmed = window.confirm(`Excluir o lote "${group.name}" e todas as ${group.accounts.length} contas?`);
+    const confirmed = window.confirm(`Excluir o lote "${group.name}" e todas as ${group.accounts.length} contas? As partições Chromium e os diretórios Tor serão preservados.`);
     if (!confirmed) return;
 
     mc.deleteGroup(groupId).then(() => {
@@ -964,7 +1079,8 @@ function sortOverviewByGroup() {
         })
         .map(account => account.id);
 
-    localStorage.setItem(overviewOrderKey, JSON.stringify(orderedIds));
+    overviewOrder = orderedIds;
+    persist(api.storage.setOverviewOrder(orderedIds));
 
     const cells = [...document.querySelectorAll(".cell")].sort((a, b) => {
         return orderedIds.indexOf(Number(a.dataset.accountId)) - orderedIds.indexOf(Number(b.dataset.accountId));
@@ -1062,14 +1178,6 @@ document.addEventListener("keydown", (event) => {
 });
 
 // ══════════════════════════════════════════════════
-// DevTools relay (main → renderer)
-// ══════════════════════════════════════════════════
-mc.onOpenDevTools((accountId) => {
-    const wv = webviews[accountId];
-    if (wv) wv.openDevTools();
-});
-
-// ══════════════════════════════════════════════════
 // HELPERS
 // ══════════════════════════════════════════════════
 
@@ -1081,19 +1189,11 @@ function makeNavBtn(symbol, label) {
     return btn;
 }
 
-function delay(ms) {
-    return new Promise(r => setTimeout(r, ms));
-}
-
 // — Histórico de URLs por conta —
 const MAX_HISTORY = 12;
 
-function historyKey(accountId) {
-    return `url-history-${accountId}`;
-}
-
 function loadHistory(accountId, datalist) {
-    const saved = JSON.parse(localStorage.getItem(historyKey(accountId)) || "[]");
+    const saved = profileData(accountId).urlHistory;
     datalist.innerHTML = "";
     saved.forEach(url => {
         const opt = document.createElement("option");
@@ -1104,33 +1204,35 @@ function loadHistory(accountId, datalist) {
 
 function pushHistory(accountId, url, datalist) {
     if (!url || url === "about:blank") return;
-    const key = historyKey(accountId);
-    let saved = JSON.parse(localStorage.getItem(key) || "[]");
+    let saved = profileData(accountId).urlHistory;
+    if (saved[0] === url) return;
     saved = saved.filter(u => u !== url);
     saved.unshift(url);
     if (saved.length > MAX_HISTORY) saved = saved.slice(0, MAX_HISTORY);
-    localStorage.setItem(key, JSON.stringify(saved));
+    profileData(accountId).urlHistory = saved;
+    persist(api.storage.addNavigationHistory({ profileId: accountId, url }));
     loadHistory(accountId, datalist);
 }
 
-function ipHistoryKey(accountId) {
-    return `ip-history-${accountId}`;
-}
-
 function saveIp(accountId, ip) {
-    const key = ipHistoryKey(accountId);
-    let history = JSON.parse(localStorage.getItem(key) || "[]");
+    let history = profileData(accountId).ipHistory;
+    if (history[0] === ip) return;
     history = history.filter(item => item !== ip);
     history.unshift(ip);
-    localStorage.setItem(key, JSON.stringify(history.slice(0, 50)));
+    profileData(accountId).ipHistory = history.slice(0, 50);
+    persist(api.storage.addIpHistory({ profileId: accountId, ip }));
 }
 
 function showIpHistory(account, accountName) {
-    const history = JSON.parse(localStorage.getItem(ipHistoryKey(account.id)) || "[]");
+    const history = profileData(account.id).ipHistory;
     document.getElementById("ip-dialog-title").textContent = `${accountName} · IPs usados`;
-    document.getElementById("ip-dialog-list").innerHTML = history.length
-        ? history.map(ip => `<li>${ip}</li>`).join("")
-        : "<li>Nenhum IP registrado ainda</li>";
+    const list = document.getElementById("ip-dialog-list");
+    list.replaceChildren();
+    for (const value of history.length ? history : ["Nenhum IP registrado ainda"]) {
+        const item = document.createElement("li");
+        item.textContent = value;
+        list.appendChild(item);
+    }
     document.getElementById("ip-dialog").showModal();
 }
 
@@ -1146,4 +1248,8 @@ mc.onAccountHealth((statusState) => {
         cell.dataset.health = statusState.status || "unknown";
     }
 });
+}).catch(error => {
+    console.error("Falha ao iniciar a interface:", error);
+    splashStatus.textContent = `❌ ${error.message || "Falha ao carregar dados"}`;
+    splashStatus.style.color = "#ff5555";
 });

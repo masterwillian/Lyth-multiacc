@@ -10,13 +10,15 @@ const path = require("path");
 const fs   = require("fs");
 const net  = require("net");
 const crypto = require("crypto");
-const { normalizeWorkspace } = require("./src/workspace");
 const { buildTorrc } = require("./src/tor-config");
 const { launchTorProcess } = require("./src/tor-process");
 const { ProfileRuntime } = require("./src/profile-runtime");
 const { ProfileRuntimeManager } = require("./src/profile-runtime-manager");
 const { rotateIdentity } = require("./src/newnym");
 const { configureFailClosedSession, inspectSessionProxy } = require("./src/session-routing");
+const { WorkspaceStore } = require("./src/storage/workspace-store");
+const validation = require("./src/security/ipc-validation");
+const { hardenSession, installWindowPolicies, isTrustedShellUrl } = require("./src/security/electron-security");
 
 app.commandLine.appendSwitch("force-webrtc-ip-handling-policy", "disable_non_proxied_udp");
 app.commandLine.appendSwitch("disable-background-timer-throttling");
@@ -27,6 +29,7 @@ app.commandLine.appendSwitch("disable-background-timer-throttling");
 const TOR_EXE = path.join(__dirname, "..", "tor", "tor", "tor.exe");
 const TOR_DIR = path.join(__dirname, "..", "tor");
 const GROUPS_FILE = path.join(__dirname, "groups.json");
+const DATABASE_FILE = path.join(app.getPath("userData"), "lyth.sqlite3");
 const LOGS_DIR = path.join(__dirname, "logs");
 const HEALTH_CHECK_INTERVAL_MS = 15000;
 const EXTERNAL_HEALTH_INTERVAL_MS = 5 * 60 * 1000;
@@ -34,14 +37,19 @@ const RESTART_BACKOFF_BASE_MS = 5000;
 const RESTART_BACKOFF_MAX_MS = 5 * 60 * 1000;
 const MAX_LOG_BYTES = 5 * 1024 * 1024;
 
-function loadWorkspace() {
-    return normalizeWorkspace(JSON.parse(fs.readFileSync(GROUPS_FILE, "utf8")));
-}
-
-const workspace = loadWorkspace();
+const workspaceStore = new WorkspaceStore({
+    databasePath: DATABASE_FILE,
+    legacyPath: GROUPS_FILE,
+    backupPath: path.join(app.getPath("userData"), "groups.pre-sqlite-backup.json")
+});
+let workspace = workspaceStore.getWorkspace();
 let groups = workspace.groups;
-let nextGroupId = workspace.nextGroupId;
-let nextAccountId = workspace.nextAccountId;
+
+function refreshWorkspace() {
+    workspace = workspaceStore.getWorkspace();
+    groups = workspace.groups;
+    return workspace;
+}
 
 function ensureLogsDir() {
     fs.mkdirSync(LOGS_DIR, { recursive: true });
@@ -98,13 +106,6 @@ function accountDetails(account, group) {
 function getAccounts() {
     return groups.flatMap(group => group.accounts.map(account => accountDetails(account, group)));
 }
-
-function saveGroups() {
-    fs.writeFileSync(GROUPS_FILE, JSON.stringify({ groups, nextGroupId, nextAccountId }, null, 2) + "\n");
-}
-
-function reserveGroupId() { return nextGroupId++; }
-function reserveAccountId() { return nextAccountId++; }
 
 function ensureTorFiles(account) {
     const instanceDir = path.dirname(account.torrcFile);
@@ -200,6 +201,7 @@ function testTcpPort(port) {
 async function createProfileSession(account) {
     const partition = `persist:account-${account.id}`;
     const ses = session.fromPartition(partition, { cache: true });
+    hardenSession(ses);
 
     await configureFailClosedSession(ses, account);
 
@@ -222,14 +224,69 @@ function createMainWindow() {
             preload: path.join(__dirname, "preload.js"),
             contextIsolation: true,
             nodeIntegration: false,
-            sandbox: false,
+            sandbox: true,
             webviewTag: true,
         }
     });
 
     win.setMenuBarVisibility(false);
-    win.loadFile(path.join(__dirname, "index.html"));
+    const indexPath = path.join(__dirname, "index.html");
+    hardenSession(win.webContents.session);
+    installWindowPolicies(win, {
+        indexPath,
+        isKnownPartition(partition) {
+            const match = /^persist:account-(\d+)$/.exec(partition);
+            return Boolean(match && workspaceStore.hasProfile(Number(match[1])));
+        },
+        onBlocked(details) {
+            writeLog("warn", "Blocked Electron navigation capability", {
+                component: "security",
+                ...details
+            });
+        }
+    });
+    win.webContents.on("console-message", details => {
+        const numericLevel = Number(details.level);
+        const isWarning = details.level === "warning" || (Number.isFinite(numericLevel) && numericLevel === 2);
+        const isError = details.level === "error" || (Number.isFinite(numericLevel) && numericLevel > 2);
+        if (!isWarning && !isError) return;
+        writeLog(isError ? "error" : "warn", "Renderer console message", {
+            component: "renderer",
+            error: details.message,
+            line: details.lineNumber,
+            source: details.sourceId
+        });
+    });
+    win.webContents.on("render-process-gone", (_event, details) => {
+        writeLog("error", "Renderer process exited", { component: "renderer", reason: details.reason, exitCode: details.exitCode });
+    });
+    win.loadFile(indexPath);
     return win;
+}
+
+function assertTrustedIpcSender(event) {
+    const senderUrl = event.senderFrame?.url || event.sender?.getURL?.() || "";
+    const trusted = mainWin && !mainWin.isDestroyed()
+        && event.sender === mainWin.webContents
+        && isTrustedShellUrl(senderUrl, path.join(__dirname, "index.html"));
+    if (!trusted) throw new validation.ValidationError("Remetente IPC não autorizado");
+}
+
+function handleSecure(channel, handler) {
+    ipcMain.handle(channel, async (event, ...args) => {
+        try {
+            assertTrustedIpcSender(event);
+            return await handler(event, ...args);
+        } catch (error) {
+            writeLog(error instanceof validation.ValidationError ? "warn" : "error", "IPC operation failed", {
+                component: "ipc",
+                event: channel,
+                errorCode: error.code || error.name,
+                error: error.message
+            });
+            throw error;
+        }
+    });
 }
 
 // ─────────────────────────────────────────────
@@ -289,20 +346,8 @@ async function checkForLeaks(accountId, force = false) {
     return { accountId: account.id, ip: route.ip, hasLeak, reachable: route.reachable, verified: route.isTor === true, message };
 }
 
-ipcMain.handle("get-account-info", () => {
-    return getAccounts().map(a => ({
-        id: a.id,
-        name: a.name,
-        batchId: a.batchId,
-        batchName: a.batchName,
-        torPort: a.torPort,
-        controlPort: a.controlPort,
-        partition: `persist:account-${a.id}`
-    }));
-});
-
-ipcMain.handle("get-account-health", (_, accountId) => {
-    const resolvedId = Number(accountId);
+handleSecure("get-account-health", (_, accountId) => {
+    const resolvedId = validation.id(accountId, "accountId");
     return runtimeManager.get(resolvedId)?.snapshot() || {
         accountId: resolvedId,
         state: "STOPPED",
@@ -315,40 +360,104 @@ ipcMain.handle("get-account-health", (_, accountId) => {
 });
 
 // ── Leak Detection IPC ──
-ipcMain.handle("check-leaks", async (_, { accountId, force = false } = {}) => {
-    return checkForLeaks(accountId, force === true);
+handleSecure("check-leaks", async (_, input) => {
+    const { accountId, force = false } = validation.object(input, "verificação de rota");
+    const payload = { accountId, force };
+    return checkForLeaks(validation.id(payload.accountId, "accountId"), payload.force === undefined ? false : validation.boolean(payload.force, "force"));
 });
 
-ipcMain.handle("get-workspace", () => ({
+handleSecure("get-workspace", () => ({
     groups,
     accounts: getAccounts().map(a => ({
         id: a.id, name: a.name, batchId: a.batchId, batchName: a.batchName,
         torPort: a.torPort, controlPort: a.controlPort,
         partition: `persist:account-${a.id}`
-    }))
+    })),
+    uiState: {
+        overviewOrder: workspaceStore.getSetting("overview_order", []),
+        profiles: workspaceStore.profileUiData()
+    }
 }));
 
-ipcMain.handle("get-app-version", () => app.getVersion());
+handleSecure("get-app-version", () => app.getVersion());
 
-ipcMain.handle("create-group", async (_, { name, accountCount }) => {
-    const count = Number(accountCount);
-    if (!Number.isInteger(count) || count < 1 || count > 20) {
-        throw new Error("O grupo deve ter entre 1 e 20 contas.");
+function validateBookmarks(value) {
+    if (!Array.isArray(value) || value.length > 200) throw new validation.ValidationError("favoritos inválidos");
+    return value.map(item => {
+        const bookmark = validation.object(item, "favorito");
+        return {
+            url: validation.webUrl(bookmark.url),
+            title: validation.text(bookmark.title || bookmark.url, { label: "título", max: 300 }),
+            date: typeof bookmark.date === "string" && !Number.isNaN(Date.parse(bookmark.date)) ? bookmark.date : new Date().toISOString()
+        };
+    });
+}
+
+handleSecure("storage-import-legacy-renderer", (_, input) => {
+    const payload = validation.object(input, "dados locais");
+    const profiles = {};
+    const entries = Object.entries(validation.object(payload.profiles || {}, "perfis"));
+    if (entries.length > 1000) throw new validation.ValidationError("perfis locais demais");
+    for (const [profileIdText, raw] of entries) {
+        const profileId = validation.id(profileIdText, "profileId");
+        const data = validation.object(raw, "dados do perfil");
+        const ips = validation.stringArray(data.ipHistory || [], { label: "histórico de IP", maxItems: 50, itemMax: 45 });
+        if (ips.some(ip => !net.isIP(ip))) throw new validation.ValidationError("histórico de IP inválido");
+        profiles[profileId] = {
+            lastUrl: validation.optionalWebUrl(data.lastUrl),
+            urlHistory: validation.stringArray(data.urlHistory || [], { label: "histórico de URL", maxItems: 50 }).map(url => validation.webUrl(url)),
+            ipHistory: ips,
+            bookmarks: validateBookmarks(data.bookmarks || [])
+        };
     }
+    return workspaceStore.importRendererData({
+        overviewOrder: validation.idArray(payload.overviewOrder || []),
+        profiles
+    });
+});
 
-    const groupId = reserveGroupId();
-    const group = {
-        id: groupId,
-        name: String(name || `Lote ${groupId}`).trim() || `Lote ${groupId}`,
-        accounts: Array.from({ length: count }, () => {
-            const id = reserveAccountId();
-            return { id, name: `Conta ${id}` };
-        })
-    };
-    groups = [...groups, group];
+handleSecure("storage-set-overview-order", (_, order) => {
+    workspaceStore.setSetting("overview_order", validation.idArray(order));
+    return true;
+});
+
+handleSecure("storage-set-last-url", (_, input) => {
+    const payload = validation.object(input);
+    workspaceStore.setLastUrl(validation.id(payload.profileId, "profileId"), validation.webUrl(payload.url));
+    return true;
+});
+
+handleSecure("storage-add-navigation-history", (_, input) => {
+    const payload = validation.object(input);
+    workspaceStore.addNavigationHistory(validation.id(payload.profileId, "profileId"), validation.webUrl(payload.url));
+    return true;
+});
+
+handleSecure("storage-replace-bookmarks", (_, input) => {
+    const payload = validation.object(input);
+    workspaceStore.replaceBookmarks(validation.id(payload.profileId, "profileId"), validateBookmarks(payload.bookmarks));
+    return true;
+});
+
+handleSecure("storage-add-ip-history", (_, input) => {
+    const payload = validation.object(input);
+    const ip = validation.text(payload.ip, { label: "IP", max: 45 });
+    if (!net.isIP(ip)) throw new validation.ValidationError("IP inválido");
+    workspaceStore.addIpHistory(validation.id(payload.profileId, "profileId"), ip, "tor");
+    return true;
+});
+
+handleSecure("create-group", async (_, input) => {
+    const payload = validation.object(input, "grupo");
+    const count = validation.count(payload.accountCount);
+    const groupName = payload.name === undefined || String(payload.name).trim() === ""
+        ? ""
+        : validation.text(payload.name, { label: "nome do lote", max: 40 });
+    const group = workspaceStore.createGroup({ name: groupName, accountCount: count });
+    refreshWorkspace();
+    const groupId = Number(group.id);
     const newAccounts = group.accounts.map(account => accountDetails(account, group));
     newAccounts.forEach(ensureTorFiles);
-    saveGroups();
 
     const startup = await runtimeManager.startAll(newAccounts);
     const failures = startup.filter(item => item.status === "rejected");
@@ -381,56 +490,53 @@ ipcMain.handle("create-group", async (_, { name, accountCount }) => {
     };
 });
 
-ipcMain.handle("rename-account", (_, { accountId, name }) => {
-    const account = getAccounts().find(item => item.id === accountId);
-    if (!account) throw new Error("Conta não encontrada");
-    const group = groups.find(item => item.id === account.batchId);
-    const storedAccount = group.accounts.find(item => item.id === accountId);
-    storedAccount.name = String(name || account.name).trim() || account.name;
-    saveGroups();
-    return { id: accountId, name: storedAccount.name };
+handleSecure("rename-account", (_, input) => {
+    const payload = validation.object(input, "conta");
+    const accountId = validation.id(payload.accountId, "accountId");
+    const name = validation.text(payload.name, { label: "nome da conta", max: 80 });
+    const result = workspaceStore.renameProfile(accountId, name);
+    refreshWorkspace();
+    return result;
 });
 
-ipcMain.handle("update-group", (_, { groupId, name, tag, note }) => {
-    const group = groups.find(item => item.id === Number(groupId));
-    if (!group) throw new Error("Lote não encontrado");
-
-    group.name = String(name || group.name).trim() || group.name;
-    group.tag = String(tag || "").trim();
-    group.note = String(note || "").trim();
-    saveGroups();
-    return group;
+handleSecure("update-group", (_, input) => {
+    const payload = validation.object(input, "lote");
+    const updated = workspaceStore.updateGroup({
+        groupId: validation.id(payload.groupId, "groupId"),
+        name: validation.text(payload.name, { label: "nome do lote", max: 40 }),
+        tag: validation.text(payload.tag || "", { label: "tag", max: 30, allowEmpty: true }),
+        note: validation.text(payload.note || "", { label: "nota", max: 1000, allowEmpty: true })
+    });
+    refreshWorkspace();
+    return updated;
 });
 
-ipcMain.handle("delete-group", async (_, groupId) => {
-    const groupIndex = groups.findIndex(item => item.id === Number(groupId));
-    if (groupIndex === -1) throw new Error("Lote não encontrado");
+handleSecure("delete-group", async (_, groupId) => {
+    const resolvedGroupId = validation.id(groupId, "groupId");
+    const accountIds = workspaceStore.deleteGroup(resolvedGroupId);
+    refreshWorkspace();
 
-    const group = groups[groupIndex];
-    const accountIds = group.accounts.map(item => item.id);
-    groups.splice(groupIndex, 1);
-    saveGroups();
-
-    for (const accountId of accountIds) {
-        await runtimeManager.destroy(accountId);
-    }
-
-    if (mainWin && !mainWin.isDestroyed()) {
-        mainWin.webContents.send("group-deleted", Number(groupId));
+    const cleanup = await Promise.allSettled(accountIds.map(accountId => runtimeManager.destroy(accountId)));
+    const cleanupFailures = cleanup.filter(result => result.status === "rejected");
+    if (cleanupFailures.length) {
+        writeLog("warn", "Some profile runtimes failed to clean up after group deletion", {
+            component: "profiles",
+            groupId: resolvedGroupId,
+            failures: cleanupFailures.map(result => result.reason?.message || "unknown")
+        });
     }
 
     return true;
 });
 
-ipcMain.handle("add-account", async (_, groupId) => {
-    const group = groups.find(item => item.id === Number(groupId));
-    if (!group) throw new Error("Lote não encontrado");
-    const accountId = reserveAccountId();
-    const account = { id: accountId, name: `Conta ${accountId}` };
-    group.accounts.push(account);
+handleSecure("add-account", async (_, groupId) => {
+    const resolvedGroupId = validation.id(groupId, "groupId");
+    const added = workspaceStore.addProfile(resolvedGroupId);
+    refreshWorkspace();
+    const group = groups.find(item => Number(item.id) === resolvedGroupId);
+    const account = group.accounts.find(item => Number(item.id) === Number(added.id));
     const details = accountDetails(account, group);
     ensureTorFiles(details);
-    saveGroups();
 
     await runtimeManager.ensure(details).start().catch(error => {
         writeLog("warn", "New profile runtime failed to start and remains recoverable", {
@@ -448,12 +554,12 @@ ipcMain.handle("add-account", async (_, groupId) => {
     return result;
 });
 
-ipcMain.handle("remove-account", async (_, accountId) => {
-    const account = getAccounts().find(item => item.id === Number(accountId));
+handleSecure("remove-account", async (_, accountId) => {
+    const resolvedAccountId = validation.id(accountId, "accountId");
+    const account = getAccounts().find(item => item.id === resolvedAccountId);
     if (!account) throw new Error("Conta não encontrada");
-    const group = groups.find(item => item.id === account.batchId);
-    group.accounts = group.accounts.filter(item => item.id !== account.id);
-    saveGroups();
+    workspaceStore.removeProfile(account.id);
+    refreshWorkspace();
 
     await runtimeManager.destroy(account.id);
     if (mainWin && !mainWin.isDestroyed()) mainWin.webContents.send("account-removed", account.id);
@@ -464,11 +570,12 @@ ipcMain.handle("remove-account", async (_, accountId) => {
 // IPC — New Identity via ControlPort
 // ─────────────────────────────────────────────
 // ── Tor Circuit Info & Rotation ──
-ipcMain.handle("get-circuit-info", (_, accountId) => {
-    const account = getAccounts().find(a => a.id === accountId);
+handleSecure("get-circuit-info", (_, accountId) => {
+    const resolvedAccountId = validation.id(accountId, "accountId");
+    const account = getAccounts().find(a => a.id === resolvedAccountId);
     if (!account) return null;
     return {
-        accountId,
+        accountId: resolvedAccountId,
         name: account.name,
         torPort: account.torPort,
         controlPort: account.controlPort,
@@ -565,8 +672,9 @@ async function authenticateSafeCookie(controller, account) {
     await controller.command(`AUTHENTICATE ${clientHash}`);
 }
 
-ipcMain.handle("tor-new-identity", async (_, accountId) => {
-    const account = getAccounts().find(a => a.id === Number(accountId));
+handleSecure("tor-new-identity", async (_, accountId) => {
+    const resolvedAccountId = validation.id(accountId, "accountId");
+    const account = getAccounts().find(a => a.id === resolvedAccountId);
     if (!account) throw new Error("Conta não encontrada");
     const runtime = runtimeManager.get(account.id);
     if (!runtime) throw new Error("Runtime da conta não está ativo");
@@ -592,22 +700,11 @@ ipcMain.handle("tor-new-identity", async (_, accountId) => {
 });
 
 // ─────────────────────────────────────────────
-// IPC — Abrir DevTools de uma webview
-// ─────────────────────────────────────────────
-ipcMain.on("open-devtools", (event, accountId) => {
-    // O renderer usa webContents.id da webview — precisamos abrir devtools pelo sender
-    // Usamos executeJavaScript no renderer para acionar o devtools via webview.openDevTools()
-    // Aqui apenas repassamos o sinal de volta ao renderer
-    if (mainWin && !mainWin.isDestroyed()) {
-        mainWin.webContents.send("open-devtools-reply", accountId);
-    }
-});
-
-// ─────────────────────────────────────────────
 // Encerramento limpo
 // ─────────────────────────────────────────────
 let shutdownPromise = null;
 let quitAfterShutdown = false;
+let storageClosed = false;
 
 function stopAllRuntimes() {
     if (shutdownPromise) return shutdownPromise;
@@ -620,6 +717,10 @@ app.on("before-quit", event => {
     if (quitAfterShutdown) return;
     event.preventDefault();
     void stopAllRuntimes().finally(() => {
+        if (!storageClosed) {
+            workspaceStore.close();
+            storageClosed = true;
+        }
         quitAfterShutdown = true;
         app.quit();
     });
